@@ -385,8 +385,58 @@ def _dig(data: dict | None, *keys: str):
     return cur
 
 
+# runScoreList.type → label (Coros Training Hub race predict widget)
+_RUN_SCORE_TYPE_LABEL: dict[int, str] = {
+    1: "marathon",
+    2: "half_marathon",
+    3: "15k",
+    4: "10k",
+    5: "5k",
+    6: "3k",
+}
+
+
+def _pick_running_form(summary: dict, latest: dict) -> dict:
+    """Running form scores from summaryInfo (EU dashboard layout)."""
+    legacy_detail = (
+        _dig(summary, "runningAbilityDetail", "endurance")
+        or _dig(summary, "abilityDetail", "endurance")
+    )
+    return {
+        "total": (
+            summary.get("staminaLevel")
+            or summary.get("runningAbility")
+            or summary.get("sportAbility")
+            or latest.get("staminaLevel")
+        ),
+        "endurance": summary.get("aerobicEnduranceScore") or legacy_detail,
+        "threshold": (
+            summary.get("lactateThresholdCapacityScore")
+            or _dig(summary, "runningAbilityDetail", "threshold")
+            or _dig(summary, "abilityDetail", "threshold")
+        ),
+        "speed": (
+            summary.get("anaerobicEnduranceScore")
+            or _dig(summary, "runningAbilityDetail", "speed")
+            or _dig(summary, "abilityDetail", "speed")
+        ),
+        "sprint": (
+            summary.get("anaerobicCapacityScore")
+            or _dig(summary, "runningAbilityDetail", "sprint")
+            or _dig(summary, "abilityDetail", "sprint")
+        ),
+    }
+
+
 def _pick_recovery(summary: dict) -> dict:
     """Extract recovery widget fields from dashboard summaryInfo (keys vary by API version)."""
+    out: dict = {}
+    if summary.get("recoveryPct") is not None:
+        out["recovery_percent"] = summary.get("recoveryPct")
+    if summary.get("recoveryState") is not None:
+        out["recovery_state"] = summary.get("recoveryState")
+    if summary.get("fullRecoveryHours") is not None:
+        out["full_recovery_hours"] = summary.get("fullRecoveryHours")
     for path in (
         ("recoveryData",),
         ("recoverData",),
@@ -394,22 +444,61 @@ def _pick_recovery(summary: dict) -> dict:
     ):
         block = _dig(summary, *path)
         if isinstance(block, dict):
-            return {
-                k: block.get(k)
-                for k in (
-                    "recoveryRate", "recoveryPercent", "recoveryValue",
-                    "remainHour", "remainHours", "remainTime",
-                )
-                if block.get(k) is not None
-            }
+            for k in (
+                "recoveryRate", "recoveryPercent", "recoveryValue",
+                "remainHour", "remainHours", "remainTime",
+            ):
+                if block.get(k) is not None and k not in out:
+                    out[k] = block.get(k)
     for key in ("recoveryRate", "recoveryPercent", "recoveryValue"):
-        if summary.get(key) is not None:
-            return {key: summary.get(key)}
-    return {}
+        if summary.get(key) is not None and key not in out:
+            out[key] = summary.get(key)
+    return out
+
+
+def _pick_sleep_hrv(summary: dict) -> dict:
+    block = summary.get("sleepHrvData")
+    if not isinstance(block, dict):
+        return {}
+    recent = []
+    for item in (block.get("sleepHrvList") or [])[-7:]:
+        if isinstance(item, dict) and item.get("happenDay"):
+            recent.append({
+                "date": str(item.get("happenDay")),
+                "avg_sleep_hrv": item.get("avgSleepHrv"),
+            })
+    return {
+        "today_hrv": block.get("avgSleepHrv"),
+        "happen_day": str(block.get("happenDay", "")),
+        "recent_nights": recent,
+    }
+
+
+def _parse_run_score_list(raw: list) -> list[dict]:
+    """Race predictions from summaryInfo.runScoreList (duration + avgPace per distance type)."""
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        out.append({
+            "distance": _RUN_SCORE_TYPE_LABEL.get(t, f"type_{t}"),
+            "type": t,
+            "time_seconds": item.get("duration"),
+            "pace_seconds_per_km": item.get("avgPace"),
+        })
+    order = {label: i for i, label in enumerate(_RUN_SCORE_TYPE_LABEL.values())}
+    out.sort(key=lambda r: order.get(r["distance"], 99))
+    return out
 
 
 def _pick_race_predict(summary: dict, analyse_data: dict) -> list[dict]:
     """Race time predictions from dashboard or analyse payload."""
+    run_scores = summary.get("runScoreList")
+    if isinstance(run_scores, list) and run_scores:
+        parsed = _parse_run_score_list(run_scores)
+        if parsed:
+            return parsed
     for source in (summary, analyse_data):
         for key in ("racePredictList", "racePredict", "raceTimePredict", "predictRaceList"):
             raw = source.get(key)
@@ -455,31 +544,32 @@ async def fetch_dashboard_snapshot(auth: StoredAuth) -> dict:
     t7 = analyse_data.get("t7dayList") or []
     latest = t7[-1] if t7 else {}
 
+    sport_summary = analyse_data.get("sportDataSummary")
+    if isinstance(sport_summary, dict):
+        vo2_from_analyse = sport_summary.get("vo2max") or sport_summary.get("vo2Max")
+    else:
+        vo2_from_analyse = None
+
     return {
         "summary_info_keys": sorted(summary.keys()),
         "analyse_data_keys": sorted(analyse_data.keys()),
-        "running_form": {
-            "total": summary.get("runningAbility") or summary.get("sportAbility") or latest.get("staminaLevel"),
-            "endurance": _dig(summary, "runningAbilityDetail", "endurance")
-            or _dig(summary, "abilityDetail", "endurance"),
-            "threshold": _dig(summary, "runningAbilityDetail", "threshold")
-            or _dig(summary, "abilityDetail", "threshold"),
-            "speed": _dig(summary, "runningAbilityDetail", "speed")
-            or _dig(summary, "abilityDetail", "speed"),
-            "sprint": _dig(summary, "runningAbilityDetail", "sprint")
-            or _dig(summary, "abilityDetail", "sprint"),
-        },
+        "running_form": _pick_running_form(summary, latest),
         "training_status": {
             "label": summary.get("trainingStatus") or summary.get("trainStatus"),
-            "current_load": summary.get("trainingLoad") or latest.get("trainingLoad"),
+            "current_load": latest.get("trainingLoad", summary.get("trainingLoad")),
             "base_form": summary.get("staminaLevel") or latest.get("staminaLevel"),
-            "intensity_trend_percent": summary.get("trainingLoadRatio") or latest.get("trainingLoadRatio"),
+            "intensity_trend_percent": latest.get("trainingLoadRatio", summary.get("trainingLoadRatio")),
+            "load_ratio_state": latest.get("trainingLoadRatioState"),
+            "tired_rate": latest.get("tiredRateNew"),
+            "ati": latest.get("ati"),
+            "cti": latest.get("cti"),
         },
         "recovery": _pick_recovery(summary),
-        "vo2max": latest.get("vo2max"),
-        "lthr": latest.get("lthr"),
-        "ltsp_seconds_per_km": latest.get("ltsp"),
-        "rhr": latest.get("rhr"),
+        "sleep_hrv": _pick_sleep_hrv(summary),
+        "vo2max": vo2_from_analyse or latest.get("vo2max") or summary.get("vo2max"),
+        "lthr": summary.get("lthr") or latest.get("lthr"),
+        "ltsp_seconds_per_km": summary.get("ltsp") or latest.get("ltsp"),
+        "rhr": summary.get("rhr") or latest.get("rhr"),
         "race_predictions": _pick_race_predict(summary, analyse_data),
     }
 

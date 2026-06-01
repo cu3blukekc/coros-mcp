@@ -217,11 +217,12 @@ Returns:
 |-------|-------------|
 | `summary_info_keys` | Top-level keys under `data.summaryInfo` from `/dashboard/query` (for API discovery when Coros adds fields) |
 | `analyse_data_keys` | Top-level keys under `data` from `/analyse/query` |
-| `running_form` | `total`, `endurance`, `threshold`, `speed`, `sprint` (from `runningAbility` / `runningAbilityDetail` when present) |
-| `training_status` | `label`, `current_load`, `base_form`, `intensity_trend_percent` |
-| `recovery` | Recovery widget fields (key names vary by API version) |
-| `vo2max`, `lthr`, `ltsp_seconds_per_km`, `rhr` | Latest values from analyse `t7dayList` tail when present |
-| `race_predictions` | List of `{distance, time_seconds, pace_seconds_per_km}` when Coros exposes race predict data |
+| `running_form` | `total` (`staminaLevel`), sub-scores (`aerobicEnduranceScore`, `lactateThresholdCapacityScore`, …) or legacy `runningAbilityDetail` |
+| `training_status` | `base_form`, `current_load`, `intensity_trend_percent`, `load_ratio_state`, `tired_rate`, `ati`, `cti` |
+| `recovery` | `recovery_percent` (`recoveryPct`), `recovery_state`, `full_recovery_hours`, or legacy nested keys |
+| `sleep_hrv` | `today_hrv`, `happen_day`, `recent_nights` from `sleepHrvData` |
+| `vo2max`, `lthr`, `ltsp_seconds_per_km`, `rhr` | Dashboard `summaryInfo` first, then analyse `t7dayList` / `sportDataSummary` |
+| `race_predictions` | From `runScoreList` (`type` → 5k/10k/HM/M) or legacy `racePredictList` |
 
 Structured fields depend on what your account returns; if a widget is missing, check `summary_info_keys` and `analyse_data_keys` against the raw Coros app.
 
