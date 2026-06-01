@@ -88,6 +88,7 @@ async def get_help() -> dict:
             {"name": "authenticate_coros_mobile", "description": "Add mobile token for sleep stage data (deep/light/REM/awake)"},
             {"name": "check_coros_auth", "description": "Show current auth status, region, and token expiry"},
             {"name": "get_daily_metrics", "description": "Fetch daily training metrics: HRV, sleep hours, steps, stress, resting HR, VO2max, fitness score"},
+            {"name": "get_dashboard_snapshot", "description": "Dashboard snapshot: running form, recovery, race predictions, summaryInfo keys"},
             {"name": "get_sleep_data", "description": "Fetch nightly sleep records with duration and quality score (mobile auth required for stage breakdown)"},
             {"name": "list_activities", "description": "List recorded activities (runs, rides, swims, etc.) with summaries"},
             {"name": "get_activity_detail", "description": "Get full detail for one activity by label_id"},
@@ -299,6 +300,30 @@ async def get_daily_metrics(weeks: int = 4) -> dict:
         }
     except Exception as exc:
         return {"error": str(exc), "records": []}
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_dashboard_snapshot
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_dashboard_snapshot() -> dict:
+    """
+    Fetch Training Hub dashboard snapshot (running form, recovery, race predictions).
+
+    Uses /dashboard/query and /analyse/query. Always returns summary_info_keys
+    for API discovery; structured fields depend on what Coros returns.
+    """
+    auth = await _get_auth()
+    if auth is None:
+        return {
+            "error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.",
+        }
+    try:
+        snapshot = await _run_with_auth(coros_api.fetch_dashboard_snapshot, auth)
+        return snapshot
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------

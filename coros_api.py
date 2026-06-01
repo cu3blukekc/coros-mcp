@@ -376,6 +376,114 @@ async def fetch_hrv(auth: StoredAuth) -> list[HRVRecord]:
     return sorted(records, key=lambda r: r.date)
 
 
+def _dig(data: dict | None, *keys: str):
+    cur = data
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _pick_recovery(summary: dict) -> dict:
+    """Extract recovery widget fields from dashboard summaryInfo (keys vary by API version)."""
+    for path in (
+        ("recoveryData",),
+        ("recoverData",),
+        ("recovery",),
+    ):
+        block = _dig(summary, *path)
+        if isinstance(block, dict):
+            return {
+                k: block.get(k)
+                for k in (
+                    "recoveryRate", "recoveryPercent", "recoveryValue",
+                    "remainHour", "remainHours", "remainTime",
+                )
+                if block.get(k) is not None
+            }
+    for key in ("recoveryRate", "recoveryPercent", "recoveryValue"):
+        if summary.get(key) is not None:
+            return {key: summary.get(key)}
+    return {}
+
+
+def _pick_race_predict(summary: dict, analyse_data: dict) -> list[dict]:
+    """Race time predictions from dashboard or analyse payload."""
+    for source in (summary, analyse_data):
+        for key in ("racePredictList", "racePredict", "raceTimePredict", "predictRaceList"):
+            raw = source.get(key)
+            if isinstance(raw, list) and raw:
+                out = []
+                for item in raw[:8]:
+                    if isinstance(item, dict):
+                        out.append({
+                            "distance": item.get("distance") or item.get("sportType") or item.get("name"),
+                            "time_seconds": item.get("time") or item.get("predictTime") or item.get("value"),
+                            "pace_seconds_per_km": item.get("pace") or item.get("predictPace"),
+                        })
+                if out:
+                    return out
+    return []
+
+
+async def fetch_dashboard_snapshot(auth: StoredAuth) -> dict:
+    """
+    Training Hub dashboard + analyse summary for coach (form, recovery, race predict).
+
+    Returns structured fields when present; always includes summary_info_keys for discovery.
+    """
+    base = _base_url(auth.region)
+    headers = _auth_headers(auth)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        dash_resp, analyse_resp = await asyncio.gather(
+            client.get(base + ENDPOINTS["dashboard"], headers=headers),
+            client.get(base + ENDPOINTS["analyse"], headers=headers),
+        )
+    dash_resp.raise_for_status()
+    analyse_resp.raise_for_status()
+    dash_body = dash_resp.json()
+    analyse_body = analyse_resp.json()
+
+    _check_response(dash_body, "dashboard")
+    if analyse_body.get("result") != "0000":
+        raise ValueError(f"Coros analyse error: {analyse_body.get('message', 'unknown error')}")
+
+    summary = dash_body.get("data", {}).get("summaryInfo", {}) or {}
+    analyse_data = analyse_body.get("data", {}) or {}
+    t7 = analyse_data.get("t7dayList") or []
+    latest = t7[-1] if t7 else {}
+
+    return {
+        "summary_info_keys": sorted(summary.keys()),
+        "analyse_data_keys": sorted(analyse_data.keys()),
+        "running_form": {
+            "total": summary.get("runningAbility") or summary.get("sportAbility") or latest.get("staminaLevel"),
+            "endurance": _dig(summary, "runningAbilityDetail", "endurance")
+            or _dig(summary, "abilityDetail", "endurance"),
+            "threshold": _dig(summary, "runningAbilityDetail", "threshold")
+            or _dig(summary, "abilityDetail", "threshold"),
+            "speed": _dig(summary, "runningAbilityDetail", "speed")
+            or _dig(summary, "abilityDetail", "speed"),
+            "sprint": _dig(summary, "runningAbilityDetail", "sprint")
+            or _dig(summary, "abilityDetail", "sprint"),
+        },
+        "training_status": {
+            "label": summary.get("trainingStatus") or summary.get("trainStatus"),
+            "current_load": summary.get("trainingLoad") or latest.get("trainingLoad"),
+            "base_form": summary.get("staminaLevel") or latest.get("staminaLevel"),
+            "intensity_trend_percent": summary.get("trainingLoadRatio") or latest.get("trainingLoadRatio"),
+        },
+        "recovery": _pick_recovery(summary),
+        "vo2max": latest.get("vo2max"),
+        "lthr": latest.get("lthr"),
+        "ltsp_seconds_per_km": latest.get("ltsp"),
+        "rhr": latest.get("rhr"),
+        "race_predictions": _pick_race_predict(summary, analyse_data),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Daily analysis data  (/analyse/dayDetail/query — up to 24 weeks)
 # ---------------------------------------------------------------------------
