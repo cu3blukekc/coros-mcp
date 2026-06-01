@@ -1,6 +1,6 @@
 # coros-mcp
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that fetches sleep, HRV, and training data from the unofficial Coros API and exposes them to AI assistants like Claude.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that fetches sleep, HRV, training data, and Training Hub dashboard widgets from the unofficial Coros API and exposes them to AI assistants like Claude.
 
 **No API key required.** This server authenticates directly with your Coros Training Hub credentials. Your token is stored securely in your system keyring (or an encrypted local file as fallback), never transmitted anywhere except to Coros.
 
@@ -11,6 +11,8 @@ Ask your AI assistant questions like:
 - "How much deep sleep and REM did I get last week?"
 - "What was my HRV trend over the last 4 weeks?"
 - "Show me my resting heart rate and training load for last week"
+- "What's my running form score and recovery on the Coros dashboard?"
+- "What race times does Coros predict for 5K and marathon?"
 - "How many steps did I average per day this month?"
 - "List my rides from last month"
 - "Show me the details of my last long ride"
@@ -27,6 +29,7 @@ Ask your AI assistant questions like:
 | `authenticate_coros_mobile` | Log in to the mobile API only (useful for sleep data troubleshooting) |
 | `check_coros_auth` | Check whether a valid auth token is present |
 | `get_daily_metrics` | Fetch daily metrics (HRV, resting HR, training load, VO2max, stamina, and more) for n weeks (default: 4) |
+| `get_dashboard_snapshot` | Training Hub dashboard snapshot: running form sub-scores, training status, recovery, race predictions, API key discovery |
 | `get_sleep_data` | Fetch nightly sleep stages (deep, light, REM, awake) and sleep HR for n weeks (default: 4) |
 | `list_activities` | List activities for a date range with summary metrics |
 | `get_activity_detail` | Fetch full detail for a single activity (laps, HR zones, power zones) |
@@ -197,6 +200,32 @@ Each record includes:
 | `ltsp` | analyse (merge) | Lactate threshold pace (s/km) |
 | `stamina_level` | analyse (merge) | Base fitness level |
 | `stamina_level_7d` | analyse (merge) | 7-day fitness trend |
+
+> **Dashboard widgets:** For a **current** snapshot (running form breakdown, recovery widget, race time predictions, training status label) use `get_dashboard_snapshot`. It calls `/dashboard/query` and `/analyse/query` and does not replace the time series from `get_daily_metrics`.
+
+### `get_dashboard_snapshot`
+
+Fetch a point-in-time snapshot from the Training Hub dashboard and analyse endpoints. Useful when you need coach-style widgets (form, recovery, race predict) rather than per-day history.
+
+```json
+{}
+```
+
+Returns:
+
+| Field | Description |
+|-------|-------------|
+| `summary_info_keys` | Top-level keys under `data.summaryInfo` from `/dashboard/query` (for API discovery when Coros adds fields) |
+| `analyse_data_keys` | Top-level keys under `data` from `/analyse/query` |
+| `running_form` | `total`, `endurance`, `threshold`, `speed`, `sprint` (from `runningAbility` / `runningAbilityDetail` when present) |
+| `training_status` | `label`, `current_load`, `base_form`, `intensity_trend_percent` |
+| `recovery` | Recovery widget fields (key names vary by API version) |
+| `vo2max`, `lthr`, `ltsp_seconds_per_km`, `rhr` | Latest values from analyse `t7dayList` tail when present |
+| `race_predictions` | List of `{distance, time_seconds, pace_seconds_per_km}` when Coros exposes race predict data |
+
+Structured fields depend on what your account returns; if a widget is missing, check `summary_info_keys` and `analyse_data_keys` against the raw Coros app.
+
+On error: `{ "error": "..." }` (e.g. not authenticated).
 
 ### `get_sleep_data`
 
