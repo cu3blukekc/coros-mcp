@@ -13,14 +13,11 @@ sync_all() does a full historical backfill in 12-week chunks.
 import asyncio
 import logging
 import os
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
-from typing import Callable, Coroutine, Optional
 
-logger = logging.getLogger(__name__)
-
-import coros_api
-from cache.utils import LOCAL_TZ
-from cache.store import (
+from coros_mcp import coros_api
+from coros_mcp.cache.store import (
     cache_status,
     get_activities,
     get_daily_records,
@@ -36,8 +33,10 @@ from cache.store import (
     upsert_daily_records,
     upsert_sleep_records,
 )
-from models import ActivitySummary, DailyRecord, SleepRecord, StoredAuth
+from coros_mcp.cache.utils import LOCAL_TZ
+from coros_mcp.models import ActivitySummary, DailyRecord, SleepRecord, StoredAuth
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -55,15 +54,53 @@ def _today() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back to `default`.
+
+    A malformed (non-integer) value logs a warning and uses the default rather
+    than raising — this runs at import time, so an uncaught ValueError would
+    crash the whole MCP server with an opaque traceback instead of degrading
+    gracefully. The value itself is not range-checked.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r (not an integer); using default %d", name, raw, default)
+        return default
+
+
 # Data older than this many days is considered stable (immutable).
 # Recent data is always re-fetched to capture same-day activities and
 # delayed watch→phone syncs (HRV, sleep scores can arrive hours later).
 # Override with COROS_STABLE_DAYS env var (e.g. set to 0 to disable re-fetch,
 # or higher if your watch takes longer to sync to the phone).
-STABLE_AFTER_DAYS = int(os.getenv("COROS_STABLE_DAYS", "2"))
+STABLE_AFTER_DAYS = _env_int("COROS_STABLE_DAYS", 2)
+
+# Maximum range per API call. /analyse/dayDetail/query supports up to ~24
+# weeks; 12 weeks leaves comfortable headroom and matches sync_all's chunking.
+API_CHUNK_DAYS = 12 * 7
 
 
-def _fetch_start(max_cached: Optional[str], requested_start: str) -> str:
+async def _fetch_chunked(fetch, auth: StoredAuth, start_day: str, end_day: str) -> list:
+    """Call fetch(auth, chunk_start, chunk_end) in API_CHUNK_DAYS-sized chunks
+    and concatenate the results. Needed because the cached fetchers may face
+    arbitrarily long uncached ranges (e.g. weeks=52 on a cold cache) while
+    the underlying API endpoints cap the range per call."""
+    results: list = []
+    cursor = start_day
+    while cursor <= end_day:
+        chunk_end = min(_date_add(cursor, API_CHUNK_DAYS - 1), end_day)
+        results.extend(await fetch(auth, cursor, chunk_end))
+        cursor = _date_add(chunk_end, 1)
+        if cursor <= end_day:
+            await asyncio.sleep(0.3)
+    return results
+
+
+def _fetch_start(max_cached: str | None, requested_start: str) -> str:
     """First date we need to fetch from the API.
 
     For historical data (older than STABLE_AFTER_DAYS), only fetch the
@@ -84,12 +121,12 @@ def _fetch_start(max_cached: Optional[str], requested_start: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_fetch_range(
-    min_cached: Optional[str],
-    max_cached: Optional[str],
+    min_cached: str | None,
+    max_cached: str | None,
     start_day: str,
     end_day: str,
     cutoff: str,
-) -> Optional[tuple[str, str]]:
+) -> tuple[str, str] | None:
     """Determine the (fetch_from, fetch_to) range needed to satisfy [start_day, end_day].
 
     Returns None when the cache fully covers the requested range and no API
@@ -118,6 +155,7 @@ def _resolve_fetch_range(
         return (start_day, end_day)
 
     if historical_gap:
+        assert min_cached is not None  # implied by historical_gap
         # Fetch from start_day and bridge up to the existing cache boundary so
         # the cache stays contiguous.  If end_day already reaches or overlaps
         # min_cached, no bridging needed beyond end_day.
@@ -147,7 +185,7 @@ async def fetch_daily_records_cached(
         get_min_daily_date(), get_max_daily_date(), start_day, end_day, cutoff
     )
     if fetch_range:
-        new = await coros_api.fetch_daily_records(auth, *fetch_range)
+        new = await _fetch_chunked(coros_api.fetch_daily_records, auth, *fetch_range)
         if new:
             upsert_daily_records(new)
     return get_daily_records(start_day, end_day)
@@ -163,7 +201,7 @@ async def fetch_sleep_cached(
         get_min_sleep_date(), get_max_sleep_date(), start_day, end_day, cutoff
     )
     if fetch_range:
-        new = await coros_api.fetch_sleep(auth, *fetch_range)
+        new = await _fetch_chunked(coros_api.fetch_sleep, auth, *fetch_range)
         if new:
             upsert_sleep_records(new)
     return get_sleep_records(start_day, end_day)
@@ -213,8 +251,8 @@ async def _fetch_all_activity_pages(
 async def sync_all(
     auth: StoredAuth,
     start_day: str,
-    end_day: Optional[str] = None,
-    on_progress: Optional[Callable[[str], Coroutine]] = None,
+    end_day: str | None = None,
+    on_progress: Callable[[str], Coroutine] | None = None,
 ) -> dict:
     """
     Backfill all data from start_day to end_day (default: today) in 12-week chunks.
@@ -233,7 +271,7 @@ async def sync_all(
     """
     init_db()
     today = _today()
-    chunk_days = 12 * 7  # 12 weeks — within the API's 24-week dayDetail limit
+    chunk_days = API_CHUNK_DAYS  # 12 weeks — within the API's 24-week dayDetail limit
 
     stop = end_day if end_day else today
 

@@ -5,15 +5,17 @@ Three data tables (daily_records, sleep_records, activities) plus a
 sync_meta table that tracks the latest synced date per data type.
 """
 
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from cache.utils import LOCAL_TZ as _LOCAL_TZ
-from models import ActivitySummary, DailyRecord, SleepRecord
+from coros_mcp.cache.utils import LOCAL_TZ as _LOCAL_TZ
+from coros_mcp.models import ActivitySummary, DailyRecord, SleepRecord
+
+logger = logging.getLogger(__name__)
 
 CACHE_DB = Path.home() / ".config" / "coros-mcp" / "cache.db"
 
@@ -79,13 +81,13 @@ def get_daily_records(start_day: str, end_day: str) -> list[DailyRecord]:
     return [DailyRecord.model_validate_json(r["data"]) for r in rows]
 
 
-def get_max_daily_date() -> Optional[str]:
+def get_max_daily_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MAX(date) AS d FROM daily_records").fetchone()
     return row["d"] if row and row["d"] else None
 
 
-def get_min_daily_date() -> Optional[str]:
+def get_min_daily_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MIN(date) AS d FROM daily_records").fetchone()
     return row["d"] if row and row["d"] else None
@@ -113,13 +115,13 @@ def get_sleep_records(start_day: str, end_day: str) -> list[SleepRecord]:
     return [SleepRecord.model_validate_json(r["data"]) for r in rows]
 
 
-def get_max_sleep_date() -> Optional[str]:
+def get_max_sleep_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MAX(date) AS d FROM sleep_records").fetchone()
     return row["d"] if row and row["d"] else None
 
 
-def get_min_sleep_date() -> Optional[str]:
+def get_min_sleep_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MIN(date) AS d FROM sleep_records").fetchone()
     return row["d"] if row and row["d"] else None
@@ -162,10 +164,24 @@ def _activity_start_day(a: ActivitySummary) -> str:
 
 def upsert_activities(activities: list[ActivitySummary]) -> None:
     now = int(time.time())
+    rows = []
+    for a in activities:
+        start_day = _activity_start_day(a)
+        if not start_day:
+            # An empty start_day would make the row invisible to range
+            # queries and pollute MIN(start_day) — skip instead of storing.
+            logger.warning(
+                "Skipping activity %s: unparseable start_time %r",
+                a.activity_id, a.start_time,
+            )
+            continue
+        rows.append((a.activity_id, start_day, a.model_dump_json(), now))
+    if not rows:
+        return
     with _conn() as con:
         con.executemany(
             "INSERT OR REPLACE INTO activities (activity_id, start_day, data, synced_at) VALUES (?, ?, ?, ?)",
-            [(a.activity_id, _activity_start_day(a), a.model_dump_json(), now) for a in activities],
+            rows,
         )
 
 
@@ -178,13 +194,13 @@ def get_activities(start_day: str, end_day: str) -> list[ActivitySummary]:
     return [ActivitySummary.model_validate_json(r["data"]) for r in rows]
 
 
-def get_max_activity_date() -> Optional[str]:
+def get_max_activity_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MAX(start_day) AS d FROM activities").fetchone()
     return row["d"] if row and row["d"] else None
 
 
-def get_min_activity_date() -> Optional[str]:
+def get_min_activity_date() -> str | None:
     with _conn() as con:
         row = con.execute("SELECT MIN(start_day) AS d FROM activities").fetchone()
     return row["d"] if row and row["d"] else None

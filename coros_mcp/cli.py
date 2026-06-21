@@ -6,8 +6,8 @@ import sys
 import time
 from pathlib import Path
 
-from auth.storage import clear_token, get_token, is_keyring_available
-from coros_api import TOKEN_TTL_MS, get_stored_auth, try_auto_login, login, login_mobile
+from coros_mcp.auth.storage import clear_token, get_token, is_keyring_available
+from coros_mcp.coros_api import TOKEN_TTL_MS, get_stored_auth, login, login_mobile, try_auto_login
 
 
 def _prompt_credentials() -> tuple[str, str, str]:
@@ -29,9 +29,9 @@ def _prompt_credentials() -> tuple[str, str, str]:
         sys.exit(1)
 
     print()
-    print("Region options: eu, us, asia")
+    print("Region options: eu, us, asia, cn")
     region = input(f"Region [{default_region}]: ").strip().lower() or default_region
-    if region not in ("eu", "us", "asia"):
+    if region not in ("eu", "us", "asia", "cn"):
         print(f"Warning: unknown region '{region}', using it anyway.")
     return email, password, region
 
@@ -144,7 +144,8 @@ def cmd_sync() -> int:
     """Full historical sync: pull all data from Coros and store locally."""
     import argparse
     from datetime import datetime, timedelta
-    from cache.sync import sync_all
+
+    from coros_mcp.cache.sync import sync_all
 
     parser = argparse.ArgumentParser(
         prog="coros-mcp sync",
@@ -212,7 +213,7 @@ def cmd_sync() -> int:
 
 def cmd_cache_status() -> int:
     """Show local cache coverage."""
-    from cache.store import cache_status, init_db
+    from coros_mcp.cache.store import cache_status, init_db
     init_db()
     c = cache_status()
     print(f"Cache: {c['db_path']}")
@@ -228,7 +229,7 @@ def cmd_cache_status() -> int:
 
 def cmd_serve() -> int:
     """Start the MCP server (stdio mode)."""
-    import server
+    from coros_mcp import server
     server.main()
     return 0
 
@@ -253,9 +254,9 @@ Usage:
 
 
 def main() -> None:
-    from auth.env import load_coros_env
+    from coros_mcp.auth.env import load_coros_env
 
-    load_coros_env(legacy_project_dir=Path(__file__).resolve().parent)
+    load_coros_env(legacy_project_dir=Path(__file__).resolve().parent.parent)
 
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
     commands = {

@@ -1,6 +1,6 @@
 """Unit tests for dashboard snapshot parsers (EU summaryInfo layout)."""
 
-from coros_api import (
+from coros_mcp.coros_api import (
     _parse_run_score_list,
     _pick_recovery,
     _pick_running_form,

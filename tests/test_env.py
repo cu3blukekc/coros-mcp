@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from auth import paths
-from auth.env import is_inside_git_repo, load_coros_env
+from coros_mcp.auth import paths
+from coros_mcp.auth.env import is_inside_git_repo, load_coros_env
 
 
 @pytest.fixture

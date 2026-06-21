@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values, load_dotenv
 
-from auth import paths
+from coros_mcp.auth import paths
 
 _COROS_ENV_KEYS = ("COROS_EMAIL", "COROS_PASSWORD", "COROS_REGION", "COROS_ACCESS_TOKEN", "COROS_TIMEZONE")
 

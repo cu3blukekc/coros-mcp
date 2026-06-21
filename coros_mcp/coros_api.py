@@ -7,23 +7,33 @@ Sleep phase data comes from the mobile API (/coros/data/statistic/daily on apieu
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import random
 import time
-from typing import Optional
 
 import httpx
 
-from auth.storage import get_token, store_token
-from models import ActivitySummary, DailyRecord, HRVRecord, SleepPhases, SleepRecord, StoredAuth
+from coros_mcp.auth.storage import get_token, store_token
+from coros_mcp.models import (
+    ActivitySummary,
+    DailyRecord,
+    HRVRecord,
+    SleepPhases,
+    SleepRecord,
+    StoredAuth,
+)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Endpoint constants
 # ---------------------------------------------------------------------------
 
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"  # noqa: E501
 
 MOBILE_LOGIN_ENDPOINT = "/coros/user/login"
 
@@ -40,8 +50,9 @@ ENDPOINTS = {
     "activity_detail": "/activity/detail/query",
     "sport_types": "/activity/fit/getImportSportList",
     "workout_list": "/training/program/query",  # POST — list/fetch workout programs
-    "workout_calculate": "/training/program/calculate",  # POST — enrich workout before add
+    "plan_list": "/training/plan/query",         # POST — list training plans
     "workout_add": "/training/program/add",     # POST — create new structured workout
+    "workout_calculate": "/training/program/calculate",  # POST — recalc distance/time/load/chart
     "workout_delete": "/training/program/delete",  # POST — delete workout(s), body: ["id1", ...]
     "schedule_sum": "/training/schedule/querysum",  # GET — planned calendar aggregates
     "schedule": "/training/schedule/query",         # GET — planned calendar detail
@@ -69,10 +80,26 @@ MOBILE_BASE_URLS = {
 TOKEN_TTL_MS = 24 * 60 * 60 * 1000  # 24 hours in milliseconds
 
 
+class CorosAPIError(ValueError):
+    """Coros API returned a non-success result code.
+
+    Carries the raw result code so callers can distinguish auth failures
+    (retryable after re-login) from other API errors.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def _check_response(body: dict, context: str) -> None:
-    """Raise ValueError if the Coros API response indicates an error."""
+    """Raise CorosAPIError if the Coros API response indicates an error."""
     if body.get("result") != "0000":
-        raise ValueError(f"Coros {context} error: {body.get('message', 'unknown error')}")
+        raise CorosAPIError(
+            str(body.get("result")),
+            f"Coros {context} error: {body.get('message', 'unknown error')} "
+            f"(result={body.get('result')})",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +110,7 @@ def _save_auth(auth: StoredAuth) -> None:
     store_token(auth.model_dump_json())
 
 
-def _load_auth() -> Optional[StoredAuth]:
+def _load_auth() -> StoredAuth | None:
     result = get_token()
     if not result.success or not result.token:
         return None
@@ -91,6 +118,7 @@ def _load_auth() -> Optional[StoredAuth]:
         data = json.loads(result.token)
         return StoredAuth(**data)
     except Exception:
+        logger.debug("Failed to parse stored auth blob", exc_info=True)
         return None
 
 
@@ -113,16 +141,18 @@ def _mobile_encrypt(plaintext: str, app_key: str) -> str:
       3. AES-128-CBC encrypt: key = appKey bytes, IV = 'weloop3_2015_03#'
       4. Base64-encode the ciphertext
     """
-    from Crypto.Cipher import AES
     import base64
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     key = app_key.encode("ascii")
     data = plaintext.encode("utf-8")
     xored = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
     pad_len = 16 - (len(xored) % 16)
     padded = xored + bytes([pad_len] * pad_len)
-    cipher = AES.new(key, AES.MODE_CBC, _MOBILE_AES_IV)
-    return base64.b64encode(cipher.encrypt(padded)).decode("ascii")
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(_MOBILE_AES_IV)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(ciphertext).decode("ascii")
 
 
 async def _mobile_login(email: str, password: str, region: str = "eu") -> tuple[str, dict]:
@@ -221,7 +251,7 @@ async def login(email: str, password: str, region: str = "eu", *, skip_mobile: b
         try:
             mobile_token, mobile_payload = await _mobile_login(email, password, region)
         except Exception:
-            pass  # mobile login is best-effort; sleep data will fail gracefully
+            logger.debug("Mobile login failed during combined login", exc_info=True)
 
     auth = StoredAuth(
         access_token=data["accessToken"],
@@ -238,14 +268,23 @@ async def login(email: str, password: str, region: str = "eu", *, skip_mobile: b
 async def login_mobile(email: str, password: str, region: str = "eu") -> StoredAuth:
     """Authenticate against the Coros mobile API only and persist the token.
 
-    If an existing StoredAuth exists, updates only the mobile fields.
-    Otherwise creates a minimal StoredAuth with only mobile credentials.
+    If an existing StoredAuth exists, updates the mobile fields and the
+    region (a mobile token is only valid on its regional host, and a region
+    switch invalidates the old web token anyway). Otherwise creates a
+    minimal StoredAuth with only mobile credentials.
     """
     mobile_token, mobile_payload = await _mobile_login(email, password, region)
 
     existing = _load_auth()
     if existing:
+        if existing.region != region:
+            logger.warning(
+                "Mobile login region %r differs from stored region %r — "
+                "updating stored region; re-run web auth if web calls fail.",
+                region, existing.region,
+            )
         existing = existing.model_copy(update={
+            "region": region,
             "mobile_access_token": mobile_token,
             "mobile_login_payload": mobile_payload,
         })
@@ -264,35 +303,58 @@ async def login_mobile(email: str, password: str, region: str = "eu") -> StoredA
     return auth
 
 
-def get_stored_auth() -> Optional[StoredAuth]:
+def get_stored_auth() -> StoredAuth | None:
     """Return stored auth if it exists and is not expired.
-    
-    When COROS_ACCESS_TOKEN env var is set, it takes precedence over
-    stored keyring/encrypted-file auth (for MCP server use cases where
-    keyring is not accessible in the subprocess).
+
+    When COROS_ACCESS_TOKEN env var is set, it replaces only the web access
+    token (for MCP server use cases where keyring is not accessible in the
+    subprocess). Stored user_id, region, and mobile token/payload are kept
+    so sleep data still works alongside an env-provided web token.
+
+    Precedence depends on whether refreshable credentials (COROS_EMAIL /
+    COROS_PASSWORD) are also configured:
+
+    - No credentials: the env token is externally managed and assumed always
+      valid, so it always wins.
+    - Credentials present: a *valid* stored token wins over the env token.
+      This lets a token minted by a prior auto-login (after the env token went
+      stale) take effect — otherwise every call would re-pay one failed
+      request plus a re-login because the stale env token was always preferred.
+      The env token is still used as a seed when no valid stored token exists.
     """
-    # Prefer explicit env var token when provided
     access_token = os.environ.get("COROS_ACCESS_TOKEN")
-    if access_token:
-        region = os.environ.get("COROS_REGION", "eu")
+    have_credentials = get_env_credentials() is not None
+    stored = _load_auth()  # loaded once; reused by both the env and stored paths
+
+    def _env_auth() -> StoredAuth:
+        region = os.environ.get("COROS_REGION") or (stored.region if stored else "eu")
         # Timestamp is set to now so the TTL check always passes — env-var
         # tokens are assumed to be externally managed and always valid.
         return StoredAuth(
-            access_token=access_token,
-            user_id="env",
+            access_token=access_token,  # type: ignore[arg-type]  # guarded by callers
+            user_id=stored.user_id if stored else "env",
             region=region,
             timestamp=int(time.time() * 1000),
-            mobile_access_token=None,
-            mobile_login_payload=None,
+            mobile_access_token=stored.mobile_access_token if stored else None,
+            mobile_login_payload=stored.mobile_login_payload if stored else None,
         )
-    # Fall back to stored auth
-    auth = _load_auth()
-    if auth and _is_token_valid(auth):
-        return auth
+
+    # Externally-managed env token with nothing to self-refresh from → trust it.
+    if access_token and not have_credentials:
+        return _env_auth()
+
+    # Prefer a valid stored token (e.g. one minted by a prior auto-login).
+    if stored and _is_token_valid(stored):
+        return stored
+
+    # Credentials present but no valid stored token yet: fall back to the env
+    # token as a seed if one was provided, otherwise signal "needs login".
+    if access_token:
+        return _env_auth()
     return None
 
 
-def get_env_credentials() -> Optional[tuple[str, str, str]]:
+def get_env_credentials() -> tuple[str, str, str] | None:
     """Return (email, password, region) from env vars, or None if not fully set."""
     email = os.environ.get("COROS_EMAIL")
     password = os.environ.get("COROS_PASSWORD")
@@ -302,7 +364,7 @@ def get_env_credentials() -> Optional[tuple[str, str, str]]:
     return None
 
 
-async def try_auto_login() -> Optional[StoredAuth]:
+async def try_auto_login() -> StoredAuth | None:
     """Attempt login using COROS_EMAIL/PASSWORD env vars. Returns None on failure.
 
     Always skips mobile login — the mobile token is obtained lazily on the first
@@ -316,6 +378,7 @@ async def try_auto_login() -> Optional[StoredAuth]:
     try:
         return await login(email, password, region)  # skip_mobile=True by default
     except Exception:
+        logger.debug("Auto-login from env credentials failed", exc_info=True)
         return None
 
 
@@ -386,7 +449,6 @@ def _dig(data: dict | None, *keys: str):
     return cur
 
 
-# runScoreList.type → label (Coros Training Hub race predict widget)
 _RUN_SCORE_TYPE_LABEL: dict[int, str] = {
     1: "marathon",
     2: "half_marathon",
@@ -647,11 +709,16 @@ async def fetch_daily_records(
             date = str(item.get("happenDay", ""))
             if date in records_by_date:
                 rec = records_by_date[date]
-                if (v := item.get("vo2max")) is not None: rec.vo2max = v
-                if (v := item.get("lthr")) is not None: rec.lthr = v
-                if (v := item.get("ltsp")) is not None: rec.ltsp = v
-                if (v := item.get("staminaLevel")) is not None: rec.stamina_level = v
-                if (v := item.get("staminaLevel7d")) is not None: rec.stamina_level_7d = v
+                if (v := item.get("vo2max")) is not None:
+                    rec.vo2max = v
+                if (v := item.get("lthr")) is not None:
+                    rec.lthr = v
+                if (v := item.get("ltsp")) is not None:
+                    rec.ltsp = v
+                if (v := item.get("staminaLevel")) is not None:
+                    rec.stamina_level = v
+                if (v := item.get("staminaLevel7d")) is not None:
+                    rec.stamina_level_7d = v
 
     return sorted(records_by_date.values(), key=lambda r: r.date)
 
@@ -691,8 +758,12 @@ def _parse_activity(item: dict) -> ActivitySummary:
         training_load=item.get("trainingLoad"),
         avg_power=item.get("avgPower"),
         normalized_power=item.get("np"),
-        elevation_gain=item.get("ascent") if item.get("ascent") is not None else (item.get("totalAscent") if item.get("totalAscent") is not None else item.get("elevationGain")),
-        elevation_loss=item.get("descent") if item.get("descent") is not None else item.get("totalDescent"),
+        elevation_gain=(
+            item.get("ascent")
+            if item.get("ascent") is not None
+            else (item.get("totalAscent") if item.get("totalAscent") is not None else item.get("elevationGain"))
+        ),
+        elevation_loss=item.get("descent") if item.get("descent") is not None else item.get("totalDescent"),  # noqa: E501
     )
 
 
@@ -702,7 +773,7 @@ async def fetch_activities(
     end_day: str,
     page: int = 1,
     size: int = 30,
-    mode_list: Optional[list[int]] = None,
+    mode_list: list[int] | None = None,
 ) -> tuple[list[ActivitySummary], int]:
     """
     Fetch activity list for a date range.
@@ -762,312 +833,70 @@ async def fetch_activity_detail(auth: StoredAuth, activity_id: str, sport_type: 
 # Workout programs  (/training/program/query + /training/program/add)
 # ---------------------------------------------------------------------------
 
-# sportType=2 = Indoor Cycling (Rollen); intensityType=6 = power in watts
-# targetType (Training Hub run builder): 2 = time (seconds), 5 = distance (centimeters)
-# Legacy/simple API: 1 = distance (meters) — still accepted by schedule API, wrong in UI builder
+# sportType=2 = Indoor Cycling (indoor trainer); intensityType=6 = power in watts
+# targetType=2 = time-based (seconds); exerciseType=2 = cycling block
 # IntensityType values: 1=weight, 2=HR, 3=pace, 4=speed, 5=none, 6=power, 7=cadence
-# hrType: 3 = % of threshold HR (LTHR / ПАНО) in run builder
 
-RUN_HUB_SPORT_TYPE = 1  # sportType in Training Hub run workout payload
-RUN_MCP_SPORT_TYPE = 100  # sport_type arg to create_workout for running plans
-
-RUN_HUB_SOURCE_ID = "425868133463670784"
-
-RUN_STEP_CATALOG: dict[str, dict] = {
-    "warmup": {
-        "exerciseType": 1,
-        "originId": "425895398452936705",
-        "overview": "sid_run_warm_up_dist",
-        "default_name": "T1120",
-    },
-    "training": {
-        "exerciseType": 2,
-        "originId": "426109589008859136",
-        "overview": "sid_run_training",
-        "default_name": "T3001",
-    },
-    "rest": {
-        "exerciseType": 4,
-        "originId": "425895398452936705",
-        "overview": "sid_run_cool_down_dist",
-        "default_name": "T1123",
-    },
-    "cooldown": {
-        "exerciseType": 3,
-        "originId": "425895456971866112",
-        "overview": "sid_run_cool_down_dist",
-        "default_name": "T1122",
-    },
-}
-
+# Note: the workout API uses sportType=1 for Running; the activity API uses
+# 100 (and 102 Trail, 103 Track). _build_workout_program_payload maps the
+# activity-side run IDs → 1 on the way out. The old 100: "Running" entry here
+# never round-tripped, because the API only ever speaks sportType=1 for runs.
+# Keyed by WORKOUT-namespace (wire) sport IDs — the sportType the workout API
+# stores and returns, not the activity-namespace IDs callers pass in. All run
+# flavors (activity 100/102/103) are collapsed to wire 1 on write, so a run
+# fetched back always reads as wire 1 here. Only consult this with wire IDs;
+# map activity IDs through _RUNNING_ACTIVITY_SPORT_TYPES first.
 WORKOUT_SPORT_NAMES: dict[int, str] = {
-    1: "Running (Training Hub)",
+    1: "Running",
     2: "Indoor Cycling",
     4: "Strength",
-    100: "Running",
     200: "Road Bike",
     201: "Indoor Cycling (alt)",
 }
 
+# Activity-namespace sport IDs that are run flavors. The workout API has no
+# separate trail/track/treadmill workout type — they all collapse to the
+# single Running wire ID (sportType=1) and carry the same metadata block.
+_RUNNING_ACTIVITY_SPORT_TYPES = frozenset({100, 102, 103})
 
-def _ltsp_percent_fields(
-    bpm_low: int,
-    bpm_high: int,
-    *,
-    threshold_hr: int = 175,
-) -> tuple[int, int]:
-    """Training Hub run builder: intensityPercent = % of LTHR (ПАНО) × 1000."""
-    thr = max(threshold_hr, 1)
+# Cycling sport IDs that pass through to the wire unchanged (no namespace
+# remap, no running metadata block): 2 Indoor Cycling, 200 Road Bike,
+# 201 Indoor Cycling (alt).
+_CYCLING_SPORT_TYPES = frozenset({2, 200, 201})
 
-    def _enc(bpm: int) -> int:
-        pct = round(int(bpm) * 100 / thr)
-        pct = max(0, min(100, pct))
-        return pct * 1000
-
-    return _enc(bpm_low), _enc(bpm_high)
-
-
-def _hr_reserve_percent_fields(
-    bpm_low: int,
-    bpm_high: int,
-    *,
-    resting_hr: int = 52,
-    max_hr: int = 195,
-) -> tuple[int, int]:
-    """
-    Coros Training Hub HR steps use intensityPercent = HRR% * 1000.
-
-    HRR% = (bpm - resting_hr) / (max_hr - resting_hr) * 100
-    (matches UI for Z2 easy: 132–142 bpm → 56000–63000 with RHR 52, max 195).
-    """
-    reserve = max(max_hr - resting_hr, 1)
-
-    def _enc(bpm: int) -> int:
-        pct = round((int(bpm) - resting_hr) * 100 / reserve)
-        pct = max(0, min(100, pct))
-        return pct * 1000
-
-    return _enc(bpm_low), _enc(bpm_high)
-
-
-def _step_hr_limits(step: dict) -> tuple[int, int, int, int, int]:
-    """Return (rhr, max_hr, ltsp, bpm_low, bpm_high) for a step dict."""
-    rhr = int(step.get("resting_hr") or step.get("rhr") or 52)
-    max_hr = int(step.get("max_hr") or step.get("max_hr_bpm") or 195)
-    ltsp = int(step.get("threshold_hr") or step.get("ltsp") or step.get("lthr") or 175)
-    low = int(step.get("intensity_low", step.get("power_low_w", 0)))
-    high = int(step.get("intensity_high", step.get("power_high_w", 0)))
-    return rhr, max_hr, ltsp, low, high
-
-
-def _running_step_kind(step: dict, default: str = "training") -> str:
-    kind = step.get("kind") or step.get("step_kind")
-    if kind in RUN_STEP_CATALOG:
-        return kind
-    name = (step.get("name") or "").lower()
-    if "wu" in name or "размин" in name or "warm" in name:
-        return "warmup"
-    if "cd" in name or "замин" in name or "cool" in name:
-        return "cooldown"
-    if step.get("duration_minutes") is not None and default == "rest":
-        return "rest"
-    return default
-
-
-def _make_run_exercise(
-    *,
-    ex_id: int,
-    name: str,
-    sport_type: int,
-    intensity_type: int,
-    step: dict,
-    target_type: int,
-    target_value: int,
-    sort_no: int,
-    group_id: str = "0",
-    is_group: bool = False,
-    sets: int = 1,
-    exercise_type: int = 2,
-) -> dict:
-    """Build one structured run exercise object for /training/program/add (legacy)."""
-    rhr, max_hr, _ltsp, low, high = _step_hr_limits(step)
-    ex: dict = {
-        "id": ex_id,
-        "name": name,
-        "exerciseType": exercise_type,
-        "sportType": sport_type,
-        "intensityType": intensity_type,
-        "intensityValue": low,
-        "intensityValueExtend": high,
-        "targetType": target_type,
-        "targetValue": target_value,
-        "sets": sets,
-        "sortNo": sort_no,
-        "restType": 3,
-        "restValue": 0,
-        "groupId": group_id,
-        "isGroup": is_group,
-        "originId": "0",
-        "hrType": 0,
-        "intensityMultiplier": 0,
-        "intensityPercent": 0,
-        "intensityPercentExtend": 0,
-    }
-    if intensity_type == 2 and low and high:
-        ip, ipe = _hr_reserve_percent_fields(low, high, resting_hr=rhr, max_hr=max_hr)
-        ex["intensityPercent"] = ip
-        ex["intensityPercentExtend"] = ipe
-    return ex
-
-
-def _resolve_step_target(
-    step: dict, *, running_hub: bool = False
-) -> tuple[int, int, int]:
-    """
-    Map a plain step dict to Coros (target_type, target_value, estimated_seconds).
-
-    running_hub=True (sport_type 100): UI builder format — distance targetType 5, cm.
-    Otherwise: targetType 1 meters (legacy) or 2 seconds.
-    """
-    if step.get("distance_km") is not None:
-        meters = int(round(float(step["distance_km"]) * 1000))
-        pace = int(step.get("pace_sec_per_km") or 300)
-        est = int(meters / 1000 * pace)
-        if running_hub:
-            return 5, meters * 100, est
-        return 1, meters, est
-    if step.get("distance_meters") is not None:
-        meters = int(step["distance_meters"])
-        pace = int(step.get("pace_sec_per_km") or 300)
-        est = int(meters / 1000 * pace)
-        if running_hub:
-            return 5, meters * 100, est
-        return 1, meters, est
-    if step.get("duration_minutes") is not None:
-        seconds = int(step["duration_minutes"] * 60)
-        return 2, seconds, seconds
-    raise ValueError(
-        "Each step needs distance_km, distance_meters, or duration_minutes"
-    )
-
-
-def _make_hub_run_exercise(
-    *,
-    ex_id: int,
-    step: dict,
-    kind: str,
-    target_type: int,
-    target_value: int,
-    sort_no: int,
-    intensity_type: int,
-    group_id: str = "",
-    is_group: bool = False,
-    sets: int = 1,
-) -> dict:
-    """Exercise object matching Training Hub run builder (captured UI payload)."""
-    catalog = RUN_STEP_CATALOG[kind]
-    _rhr, _max_hr, ltsp, low, high = _step_hr_limits(step)
-    name = step.get("name") or catalog["default_name"]
-    ex: dict = {
-        "access": 0,
-        "createTimestamp": 0,
-        "defaultOrder": sort_no,
-        "equipment": [1],
-        "exerciseType": catalog["exerciseType"] if not is_group else 0,
-        "groupId": group_id,
-        "hrType": 0,
-        "id": ex_id,
-        "intensityCustom": 0,
-        "intensityDisplayUnit": 0,
-        "intensityMultiplier": 0,
-        "intensityType": intensity_type if not is_group else 0,
-        "intensityValue": low,
-        "intensityValueExtend": high,
-        "isDefaultAdd": 0,
-        "isGroup": is_group,
-        "isIntensityPercent": False,
-        "name": name,
-        "originId": step.get("origin_id") or catalog["originId"],
-        "overview": step.get("overview") or catalog["overview"],
-        "part": [0],
-        "restType": 3,
-        "restValue": 0,
-        "sets": sets,
-        "sortNo": sort_no,
-        "sourceId": "0",
-        "sourceUrl": "",
-        "sportType": RUN_HUB_SPORT_TYPE if not is_group else 0,
-        "subType": 0,
-        "targetDisplayUnit": 1 if target_type == 5 else 0,
-        "targetType": target_type,
-        "targetValue": target_value,
-        "userId": 0,
-        "videoUrl": "",
-        "intensityPercent": 0,
-        "intensityPercentExtend": 0,
-    }
-    if is_group:
-        ex.update({
-            "name": "",
-            "overview": "",
-            "originId": "",
-            "equipment": [],
-            "targetType": "",
-            "targetValue": 0,
-            "restType": 0,
-            "restValue": 30,
-        })
-    elif intensity_type == 2 and low and high:
-        # hrType 3 + %ПАНО: API /program/add затирает все шаги в Z3 (159–166).
-        # Абсолютный пульс (hrType 0) сохраняет диапазон по шагам.
-        ex.update({
-            "hrType": 0,
-            "isIntensityPercent": False,
-            "intensityCustom": 0,
-            "intensityPercent": 0,
-            "intensityPercentExtend": 0,
-            "intensityValue": low,
-            "intensityValueExtend": high,
-        })
-    return ex
+# Every sport_type _build_workout_program_payload accepts. Anything else is
+# rejected rather than emitted as-is: an unknown ID would otherwise produce a
+# cycling-shaped payload with a bogus wire sportType that fails silently on
+# the COROS side. (Strength uses a separate builder and is not listed here.)
+_KNOWN_SPORT_TYPES = _RUNNING_ACTIVITY_SPORT_TYPES | _CYCLING_SPORT_TYPES
 
 
 def _parse_workout(item: dict) -> dict:
     exercises = []
     for ex in item.get("exercises", []):
-        tt = ex.get("targetType")
-        tv = ex.get("targetValue")
-        entry = {
+        exercises.append({
             "name": ex.get("name"),
-            "target_type": tt,
-            "target_value": tv,
+            "duration_seconds": ex.get("targetValue"),
             "intensity_low": ex.get("intensityValue"),
             "intensity_high": ex.get("intensityValueExtend"),
             "sets": ex.get("sets", 1),
-        }
-        if tt == 1 and tv is not None:
-            entry["distance_meters"] = tv
-            entry["distance_km"] = round(tv / 1000, 3)
-        elif tt == 5 and tv is not None:
-            entry["distance_meters"] = tv // 100
-            entry["distance_km"] = round(tv / 100000, 3)
-        elif tt == 2 and tv is not None:
-            entry["duration_seconds"] = tv
-        exercises.append(entry)
+        })
+    # sportType from the workout API is always a wire ID (runs come back as 1,
+    # never 100/102/103), so the wire-keyed lookup below is correct here.
     sport = item.get("sportType")
     return {
         "id": str(item.get("id", "")),
         "name": item.get("name"),
         "sport_type": sport,
-        "sport_name": WORKOUT_SPORT_NAMES.get(sport, f"Sport {sport}"),
+        "sport_name": WORKOUT_SPORT_NAMES.get(sport, f"Sport {sport}") if sport is not None else None,
         "estimated_time_seconds": item.get("estimatedTime"),
         "exercise_count": item.get("exerciseNum", len(exercises)),
         "exercises": exercises,
     }
 
 
-async def fetch_workouts(auth: StoredAuth) -> list[dict]:
-    """List all user workout programs."""
+async def fetch_workout_templates(auth: StoredAuth) -> list[dict]:
+    """List all reusable workout templates in the user's library."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             _base_url(auth.region) + ENDPOINTS["workout_list"],
@@ -1082,42 +911,300 @@ async def fetch_workouts(auth: StoredAuth) -> list[dict]:
     return [_parse_workout(w) for w in body.get("data", [])]
 
 
-async def _calculate_program(auth: StoredAuth, payload: dict) -> dict:
-    """Enrich workout via Training Hub calculate (fills fields the UI expects)."""
+def _parse_training_plan(item: dict) -> dict:
+    programs = item.get("programs", [])
+    entities = item.get("entities", [])
+    return {
+        "id": str(item.get("id", "")),
+        "name": item.get("name"),
+        "overview": item.get("overview"),
+        "status": item.get("status"),
+        "execute_status": item.get("executeStatus"),
+        "start_day": item.get("startDay"),
+        "end_day": item.get("endDay"),
+        "total_day": item.get("totalDay"),
+        "min_weeks": item.get("minWeeks"),
+        "max_weeks": item.get("maxWeeks"),
+        "program_count": len(programs),
+        "entity_count": len(entities),
+    }
+
+
+async def _fetch_training_plans_data(
+    auth: StoredAuth, status_list: list[int] | None = None
+) -> list[dict]:
+    """Shared POST for /training/plan/query. Returns the raw plan list."""
+    payload = {"statusList": status_list or [1, 2]}
+    params = {"teamId": "", "userId": ""}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            _base_url(auth.region) + ENDPOINTS["workout_calculate"],
+            _base_url(auth.region) + ENDPOINTS["plan_list"],
+            params=params,
             json=payload,
             headers=_auth_headers(auth),
         )
         resp.raise_for_status()
         body = resp.json()
 
-    _check_response(body, "workout calculate")
-    data = body.get("data")
-    if isinstance(data, dict) and data.get("exercises"):
-        return data
+    _check_response(body, "training plan list")
+    return body.get("data", [])
+
+
+async def fetch_training_plans(
+    auth: StoredAuth,
+    status_list: list[int] | None = None,
+) -> list[dict]:
+    """List user training plans (summarized). Defaults to statusList [1, 2]."""
+    return [_parse_training_plan(p) for p in await _fetch_training_plans_data(auth, status_list)]
+
+
+async def fetch_training_plans_raw(
+    auth: StoredAuth,
+    status_list: list[int] | None = None,
+) -> list[dict]:
+    """List user training plans without stripping API fields."""
+    return await _fetch_training_plans_data(auth, status_list)
+
+
+def _build_workout_program_payload(
+    name: str,
+    steps: list[dict],
+    sport_type: int = 2,
+    intensity_type: int | None = None,
+) -> dict:
+    """Sync builder for the cycling/intervals/running program dict.
+
+    steps: list of dicts — either plain steps or repeat groups (see
+    save_workout_template docstring).
+
+    sport_type uses the activity namespace (the IDs list_activities
+    returns), not the workout-API wire IDs:
+
+      - 2   = Indoor Cycling (default)
+      - 200 = Road Bike, 201 = Indoor Cycling (alt)
+      - 100 = Running, 102 = Trail Running, 103 = Track Running
+        (all mapped to the workout-side wire ID sportType=1 and given the
+        metadata block COROS requires for runs)
+
+    Passing the wire ID 1 directly is rejected — callers must use the
+    activity-side run IDs so the running metadata block is always applied.
+    Cycling (the default) is unchanged.
+
+    intensity_type=None resolves per sport: runs default to HR (2), the
+    natural running target; cycling/everything else defaults to power (6).
+    Pass an explicit value to override.
+    """
+    if not steps:
+        raise ValueError("workout requires at least one step")
+    exercises: list[dict] = []
+    top_index = 0  # counts top-level positions for sortNo
+    total_seconds = 0
+    ex_id = 0  # sequential exercise IDs (API uses these to link groups)
+
+    # Workout API uses a single Running wire ID (sportType=1); the activity
+    # API splits runs into 100 (Running), 102 (Trail), 103 (Track). Accept
+    # the activity-side IDs (what list_activities returns) and map them onto
+    # the wire ID. Reject the wire ID itself so a caller can't slip past the
+    # running metadata block and reproduce the app-crash / strength-render bug.
+    if sport_type == 1:
+        raise ValueError(
+            "Pass sport_type=100 for running (activity-namespace ID); 1 is the "
+            "internal workout-API ID and must not be passed directly."
+        )
+    if sport_type not in _KNOWN_SPORT_TYPES:
+        raise ValueError(
+            f"Unknown sport_type={sport_type}. Supported: "
+            "100/102/103 (Running/Trail/Track), 2 (Indoor Cycling), "
+            "200 (Road Bike), 201 (Indoor Cycling alt)."
+        )
+    is_running = sport_type in _RUNNING_ACTIVITY_SPORT_TYPES
+    wire_sport_type = 1 if is_running else sport_type
+
+    # Resolve the per-sport default intensity: runs default to HR (2), the
+    # natural running target; cycling keeps power (6). An explicit value wins.
+    if intensity_type is None:
+        intensity_type = 2 if is_running else 6
+
+    for step in steps:
+        if "repeat" in step:
+            # --- Repeat group ---
+            top_index += 1
+            ex_id += 1
+            group_sort = 16777216 * top_index
+            group_id = ex_id
+
+            sub_steps = step["steps"]
+            iteration_seconds = sum(
+                int(s["duration_minutes"] * 60) for s in sub_steps
+            )
+            total_seconds += iteration_seconds * step["repeat"]
+
+            exercises.append({
+                "id": group_id,
+                "name": "Group",
+                "exerciseType": 0,
+                "sportType": wire_sport_type,
+                "intensityType": 0,
+                "intensityValue": 0,
+                "targetType": 2,
+                "targetValue": iteration_seconds,
+                "sets": step["repeat"],
+                "sortNo": group_sort,
+                "restType": 3,
+                "restValue": 0,
+                "groupId": "0",
+                "isGroup": True,
+                "originId": "0",
+            })
+
+            for j, sub in enumerate(sub_steps):
+                ex_id += 1
+                sub_duration = int(sub["duration_minutes"] * 60)
+                exercises.append({
+                    "id": ex_id,
+                    "name": sub["name"],
+                    "exerciseType": 2,
+                    "sportType": wire_sport_type,
+                    "intensityType": intensity_type,
+                    "intensityValue": sub.get("intensity_low", sub.get("power_low_w", 0)),
+                    "intensityValueExtend": sub.get("intensity_high", sub.get("power_high_w", 0)),
+                    "targetType": 2,
+                    "targetValue": sub_duration,
+                    "sets": 1,
+                    "sortNo": group_sort + 65536 * (j + 1),
+                    "restType": 3,
+                    "restValue": 0,
+                    "groupId": str(group_id),
+                    "isGroup": False,
+                    "originId": "0",
+                })
+        else:
+            # --- Plain step ---
+            top_index += 1
+            ex_id += 1
+            duration_s = int(step["duration_minutes"] * 60)
+            total_seconds += duration_s
+            exercises.append({
+                "id": ex_id,
+                "name": step["name"],
+                "exerciseType": 2,
+                "sportType": wire_sport_type,
+                "intensityType": intensity_type,
+                "intensityValue": step.get("intensity_low", step.get("power_low_w", 0)),
+                "intensityValueExtend": step.get("intensity_high", step.get("power_high_w", 0)),
+                "targetType": 2,
+                "targetValue": duration_s,
+                "sets": 1,
+                "sortNo": 16777216 * top_index,
+                "restType": 3,
+                "restValue": 0,
+                "groupId": "0",
+                "isGroup": False,
+                "originId": "0",
+            })
+
+    payload = {
+        "name": name,
+        "sportType": wire_sport_type,
+        "estimatedTime": total_seconds,
+        "access": 1,
+        "exercises": exercises,
+    }
+
+    # Running programs need the same metadata block strength programs
+    # carry. Without it the COROS app fails to parse the entry or renders
+    # it as strength on the watch.
+    if is_running:
+        # exerciseType markers (1=warmup, 3=cooldown) attach to the FIRST and
+        # LAST top-level steps, and only when those steps are plain. A repeat
+        # group is structural (never warmup/cooldown) and its sub-steps are
+        # always main work. Gating on the first/last top-level *items* — not on
+        # a count of plain steps — keeps the markers correct for shapes that mix
+        # a single plain step with a group: "[warmup, intervals]" still tags the
+        # warmup, "[intervals, cooldown]" still tags the cooldown. Everything
+        # else (interior plain steps, single-step workouts) stays main (the
+        # exerciseType=2 written at construction).
+        top_level_plain = [
+            e for e in exercises
+            if not e.get("isGroup") and e.get("groupId", "0") == "0"
+        ]
+        if len(steps) > 1 and top_level_plain:
+            if "repeat" not in steps[0]:
+                top_level_plain[0]["exerciseType"] = 1   # warmup
+            if "repeat" not in steps[-1]:
+                top_level_plain[-1]["exerciseType"] = 3  # cooldown
+        # Per-step run metadata applies to every non-group step — top-level
+        # plain steps AND repeat sub-steps — so interval blocks render too.
+        # The group container carries none. hrType=2 marks HR-based targets.
+        for ex in exercises:
+            if ex.get("isGroup"):
+                continue
+            # Repeat sub-steps (groupId != "0") are always main work. Set it
+            # explicitly here so running classification owns it, rather than
+            # silently inheriting the exerciseType=2 the construction path
+            # happens to write — a cycling-path refactor must not break this.
+            if ex.get("groupId", "0") != "0":
+                ex["exerciseType"] = 2
+            ex.setdefault("exerciseKind", 0)
+            ex.setdefault("gradeSystem", 0)
+            ex["hrType"] = 2 if intensity_type == 2 else 0
+            ex.setdefault("intensityMultiplier", 0)
+            ex.setdefault("intensityPercent", 0)
+            ex.setdefault("intensityPercentExtend", 0)
+            ex.setdefault("onsightGradeOffset", 0)
+            ex.setdefault("overview", "")
+            ex.setdefault("packageTime", 0)
+            ex.setdefault("sourceId", "0")
+            ex.setdefault("subType", 0)
+            ex.setdefault("targetDisplayUnit", 0)
+        # exerciseNum / totalSets count real exercise steps only. A repeat
+        # group adds a structural container row (isGroup=True) to `exercises`
+        # that is glue, not a step — counting it inflates these by one per
+        # group. Flat workouts have no containers, so this matches len() there.
+        real_step_count = sum(1 for e in exercises if not e.get("isGroup"))
+        payload.update({
+            "duration": total_seconds,
+            "exerciseNum": real_step_count,
+            "gradeSystemVersion": 0,
+            "hybridTotalSets": 0,
+            "overview": "",
+            "poolLength": 0,
+            "poolLengthId": 0,
+            "poolLengthUnit": 0,
+            "referExercise": {
+                "gradeSystem": 0,
+                "hrType": 3 if intensity_type == 2 else 0,
+                "intensityType": 0,
+                "valueType": 1,
+            },
+            "sourceUrl": "",
+            # subType=65535 marks a structured workout (shared with strength).
+            "subType": 65535,
+            "totalSets": real_step_count,
+            "trainingLoad": 0,
+            "type": 0,
+            "videoCoverUrl": "",
+            "videoUrl": "",
+        })
+
     return payload
 
 
-async def create_workout(
+async def save_workout_template(
     auth: StoredAuth,
     name: str,
     steps: list[dict],
     sport_type: int = 2,
-    intensity_type: int = 6,
+    intensity_type: int | None = None,
 ) -> str:
     """
-    Create a new structured workout program.
+    Save a reusable cycling/intervals workout template to the Coros library.
 
     steps: list of dicts — either plain steps or repeat groups.
 
     Plain step:
-      - name: str — step label (e.g. "14 km easy")
-      - distance_km: float — preferred for running (targetType=1, meters)
-      - distance_meters: int — alternative to distance_km
-      - duration_minutes: float — time target (targetType=2); use for short rests only when distance is awkward
-      - pace_sec_per_km: int — optional estimate for estimatedTime when using distance
+      - name: str — step label (e.g. "10:00 Warm-up")
+      - duration_minutes: float — step duration in minutes
       - intensity_low: int — lower intensity target (watts, BPM, etc. per intensity_type)
       - intensity_high: int — upper intensity target (0 = open-ended)
 
@@ -1127,151 +1214,7 @@ async def create_workout(
 
     Returns the new workout ID.
     """
-    running_hub = sport_type == RUN_MCP_SPORT_TYPE
-    exercises = []
-    total_seconds = 0
-    ex_id = 0
-    sort_no = 0
-
-    def _next_sort() -> int:
-        nonlocal sort_no
-        sort_no += 1
-        return sort_no
-
-    for step in steps:
-        if "repeat" in step:
-            ex_id += 1
-            group_id = ex_id
-            group_sort = _next_sort()
-            sub_steps = step["steps"]
-            hub = running_hub
-            iteration_seconds = sum(
-                _resolve_step_target(s, running_hub=hub)[2] for s in sub_steps
-            )
-            total_seconds += iteration_seconds * step["repeat"]
-
-            if running_hub:
-                exercises.append(
-                    _make_hub_run_exercise(
-                        ex_id=group_id,
-                        step=step,
-                        kind="training",
-                        target_type="",
-                        target_value=0,
-                        sort_no=group_sort,
-                        intensity_type=intensity_type,
-                        is_group=True,
-                        sets=step["repeat"],
-                    )
-                )
-            else:
-                exercises.append({
-                    "id": group_id,
-                    "name": "Group",
-                    "exerciseType": 0,
-                    "sportType": sport_type,
-                    "intensityType": 0,
-                    "intensityValue": 0,
-                    "targetType": 2,
-                    "targetValue": iteration_seconds,
-                    "sets": step["repeat"],
-                    "sortNo": 16777216 * group_sort,
-                    "restType": 3,
-                    "restValue": 0,
-                    "groupId": "0",
-                    "isGroup": True,
-                    "originId": "0",
-                })
-
-            for sub in sub_steps:
-                ex_id += 1
-                sub_tt, sub_tv, _sub_est = _resolve_step_target(
-                    sub, running_hub=running_hub
-                )
-                if running_hub:
-                    sub_kind = _running_step_kind(
-                        sub,
-                        "rest" if sub.get("duration_minutes") is not None else "training",
-                    )
-                    exercises.append(
-                        _make_hub_run_exercise(
-                            ex_id=ex_id,
-                            step=sub,
-                            kind=sub_kind,
-                            target_type=sub_tt,
-                            target_value=sub_tv,
-                            sort_no=group_sort,
-                            intensity_type=intensity_type,
-                            group_id=str(group_id),
-                        )
-                    )
-                else:
-                    exercises.append(
-                        _make_run_exercise(
-                            ex_id=ex_id,
-                            name=sub["name"],
-                            sport_type=sport_type,
-                            intensity_type=intensity_type,
-                            step=sub,
-                            target_type=sub_tt,
-                            target_value=sub_tv,
-                            sort_no=16777216 * group_sort + 65536,
-                            group_id=str(group_id),
-                        )
-                    )
-        else:
-            ex_id += 1
-            target_type, target_value, est_s = _resolve_step_target(
-                step, running_hub=running_hub
-            )
-            total_seconds += est_s
-            if running_hub:
-                kind = _running_step_kind(step, "training")
-                exercises.append(
-                    _make_hub_run_exercise(
-                        ex_id=ex_id,
-                        step=step,
-                        kind=kind,
-                        target_type=target_type,
-                        target_value=target_value,
-                        sort_no=_next_sort(),
-                        intensity_type=intensity_type,
-                    )
-                )
-            else:
-                exercises.append(
-                    _make_run_exercise(
-                        ex_id=ex_id,
-                        name=step["name"],
-                        sport_type=sport_type,
-                        intensity_type=intensity_type,
-                        step=step,
-                        target_type=target_type,
-                        target_value=target_value,
-                        sort_no=16777216 * ex_id,
-                    )
-                )
-
-    hub_sport = RUN_HUB_SPORT_TYPE if running_hub else sport_type
-    payload = {
-        "name": name,
-        "sportType": hub_sport,
-        "estimatedTime": total_seconds,
-        "access": 1,
-        "exercises": exercises,
-        "pbVersion": 2,
-        "subType": 65535,
-        "referExercise": {"intensityType": 0, "hrType": 0, "valueType": 0},
-    }
-    if running_hub:
-        payload["sourceId"] = RUN_HUB_SOURCE_ID
-    elif not running_hub:
-        # /calculate нормализует cycling/strength; для run builder затирает
-        # пульс на всех шагах (напр. 159–166 = «Аэробная мощность»).
-        try:
-            payload = await _calculate_program(auth, payload)
-        except Exception:
-            pass
+    payload = _build_workout_program_payload(name, steps, sport_type, intensity_type)
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -1287,8 +1230,8 @@ async def create_workout(
     return str(body.get("data", ""))
 
 
-async def delete_workout(auth: StoredAuth, workout_id: str) -> None:
-    """Delete a workout program by ID."""
+async def delete_workout_template(auth: StoredAuth, workout_id: str) -> None:
+    """Delete a saved workout template by ID."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             _base_url(auth.region) + ENDPOINTS["workout_delete"],
@@ -1305,33 +1248,117 @@ async def delete_workout(auth: StoredAuth, workout_id: str) -> None:
 # Planned activities (training schedule calendar)
 # ---------------------------------------------------------------------------
 
-async def fetch_schedule(
-    auth: StoredAuth, start_day: str, end_day: str
-) -> list[dict]:
-    """
-    Fetch planned activities from the Coros training calendar.
-
-    Uses GET /training/schedule/querysum with startDate/endDate params.
-    start_day / end_day: YYYYMMDD strings.
-    Returns the raw list of scheduled items.
-    """
-    params = {
+async def _fetch_schedule_data(
+    client: httpx.AsyncClient,
+    auth: StoredAuth,
+    start_day: str,
+    end_day: str,
+) -> dict:
+    """Shared GET for /training/schedule/query. Returns the raw 'data' dict
+    (no stripping). Takes a caller-provided client so internal flows can
+    reuse a connection across multiple round-trips."""
+    params: dict[str, str | int] = {
         "startDate": start_day,
         "endDate": end_day,
         "supportRestExercise": 1,
     }
+    resp = await client.get(
+        _base_url(auth.region) + ENDPOINTS["schedule"],
+        params=params,
+        headers=_auth_headers(auth),
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    _check_response(body, "schedule")
+    return body.get("data") or {}
+
+
+async def fetch_schedule(
+    auth: StoredAuth, start_day: str, end_day: str
+) -> dict:
+    """
+    Fetch planned activities from the Coros training calendar.
+
+    start_day / end_day: YYYYMMDD strings.
+    Returns the stripped schedule dict.
+    """
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            _base_url(auth.region) + ENDPOINTS["schedule"],
-            params=params,
+        data = await _fetch_schedule_data(client, auth, start_day, end_day)
+    return _strip_schedule(data)
+
+
+async def fetch_schedule_raw(
+    auth: StoredAuth, start_day: str, end_day: str
+) -> dict:
+    """
+    Fetch planned activities without stripping fields.
+
+    Raw schedule payloads are needed when updating an existing planned workout:
+    /training/schedule/update expects the full entity/program objects, including
+    planId, planProgramId, idInPlan, exerciseBarChart, and version fields.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await _fetch_schedule_data(client, auth, start_day, end_day)
+
+
+async def calculate_workout_program(auth: StoredAuth, program: dict) -> dict:
+    """
+    Recalculate a workout program after edits.
+
+    Mirrors the Training Hub /training/program/calculate request captured from
+    the web app. The response updates derived fields such as duration,
+    estimatedDistance, estimatedValue/trainingLoad, and exerciseBarChart.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            _base_url(auth.region) + ENDPOINTS["workout_calculate"],
+            json=program,
             headers=_auth_headers(auth),
         )
         resp.raise_for_status()
         body = resp.json()
 
-    _check_response(body, "schedule")
+    _check_response(body, "workout calculate")
 
-    return _strip_schedule(body.get("data") or {})
+    data = body.get("data")
+    return data if data is not None else body
+
+
+def apply_workout_calculation(program: dict, calculation: dict) -> dict:
+    """
+    Return a copy of program with calculate() derived fields applied.
+
+    The calculate endpoint returns plan* fields rather than the original program
+    field names. Training Hub writes those values back onto the program before
+    sending /training/schedule/update.
+    """
+    updated = dict(program)
+
+    if (value := calculation.get("exerciseBarChart")) is not None:
+        updated["exerciseBarChart"] = value
+
+    if (value := calculation.get("planDuration")) is not None:
+        updated["duration"] = value
+        updated["estimatedTime"] = value
+
+    if (value := calculation.get("planTrainingLoad")) is not None:
+        updated["trainingLoad"] = value
+        updated["estimatedValue"] = value
+
+    if (value := calculation.get("planElevGain")) is not None:
+        updated["elevGain"] = value
+
+    if (value := calculation.get("planDistance")) is not None:
+        updated["distance"] = value
+        with contextlib.suppress(TypeError, ValueError):
+            updated["estimatedDistance"] = int(float(value))
+
+    if (value := calculation.get("planSets")) is not None and "sets" in updated:
+        updated["sets"] = value
+    if (value := calculation.get("planHybridTotalSets")) is not None and "totalSets" in updated:
+        updated["totalSets"] = value
+
+    return updated
 
 
 _EXERCISE_DROP = frozenset({
@@ -1405,14 +1432,242 @@ def _strip_schedule(data: dict) -> dict:
     return out
 
 
-async def create_strength_workout(
+# 1 lb = 0.45359237 kg (exact, NIST).
+_LB_TO_KG = 0.45359237
+
+
+# Module-level cache for the strength-exercise catalog. The MCP server is
+# long-lived and the Coros catalog is effectively static within a session.
+# 1h TTL balances "session never refetches" with "long-running server
+# eventually picks up catalog additions if they ever happen".
+# Cache is process-global (not region/auth-scoped) — catalog IDs are global
+# across Coros regions, and the MCP server is single-user in practice.
+_STRENGTH_CATALOG_TTL_SECONDS = 3600
+_strength_catalog_cache: dict | None = None
+_strength_catalog_loaded_at: float = 0.0
+_strength_catalog_lock = asyncio.Lock()
+
+
+def _reset_strength_catalog_cache() -> None:
+    """Test-only helper: clear the module-level strength-catalog cache so
+    the next call to _load_strength_catalog refetches. Not part of the
+    public API — production code has no reason to invalidate the cache
+    (process restart is the supported way to pick up catalog changes)."""
+    global _strength_catalog_cache, _strength_catalog_loaded_at
+    _strength_catalog_cache = None
+    _strength_catalog_loaded_at = 0.0
+
+
+def _catalog_is_fresh(now: float) -> bool:
+    return (
+        _strength_catalog_cache is not None
+        and now - _strength_catalog_loaded_at < _STRENGTH_CATALOG_TTL_SECONDS
+    )
+
+
+async def _load_strength_catalog(auth: StoredAuth) -> dict:
+    """Fetch the strength-exercise catalog and index by id, memoized at
+    module scope with a TTL. Returns {} on transient network failure —
+    callers treat empty as a resilient miss (workout still creates, only
+    diagram metadata is lost).
+
+    Auth and API-level errors (ValueError from _check_response) propagate
+    so the user learns about a broken token instead of silently getting a
+    workout without metadata.
+    """
+    global _strength_catalog_cache, _strength_catalog_loaded_at
+    if _catalog_is_fresh(time.monotonic()):
+        return _strength_catalog_cache  # type: ignore[return-value]
+
+    async with _strength_catalog_lock:
+        # Re-check inside the lock — another coroutine may have populated
+        # the cache while we were waiting.
+        if _catalog_is_fresh(time.monotonic()):
+            return _strength_catalog_cache  # type: ignore[return-value]
+
+        try:
+            catalog = await fetch_exercises(auth, 4)
+        except httpx.HTTPError:
+            # Don't cache failures — leave cache unset so a later call retries.
+            return {}
+        _strength_catalog_cache = {str(e.get("id")): e for e in catalog}
+        _strength_catalog_loaded_at = time.monotonic()
+        return _strength_catalog_cache
+
+
+def _build_strength_program_payload(
+    name: str,
+    exercises: list[dict],
+    by_id: dict,
+    sets: int = 1,
+) -> dict:
+    """Sync builder for the strength program dict — the JSON body that
+    /training/program/add accepts and that schedule/update accepts inline.
+
+    by_id is the catalog lookup ({id: catalog_entry}) used to populate per-
+    exercise muscle/part/equipment metadata and animationId (video guidance).
+    Pass {} to skip catalog enrichment.
+
+    Validation (raises ValueError):
+      - empty exercises
+      - both weight_kg and weight_lbs set on the same exercise
+      - negative weight
+    """
+    if not exercises:
+        raise ValueError("strength workout requires at least one exercise")
+
+    sets = max(1, sets)
+
+    built = []
+    total_duration = 0
+    for ex in exercises:
+        target_value = ex["target_value"]
+
+        # Rest encoding: rest_seconds=0 → restType=3 ("Skip rests"),
+        # rest_seconds>0 → restType=1 ("Rest MM:SS"). Verified against
+        # app-created workouts.
+        rest = int(ex.get("rest_seconds", 60))
+        if rest <= 0:
+            rest_type, rest_value = 3, 0
+        else:
+            rest_type, rest_value = 1, rest
+
+        ex_sets = max(1, int(ex.get("sets", 1)))
+
+        # Weight encoding (reverse-engineered 2026-05-20 from iOS-app payloads):
+        #   Bodyweight (both weight_kg and weight_lbs omitted):
+        #       intensityValue   = ""   (empty string, NOT 0)
+        #       intensityCustom  = 1
+        #       Renders as "Bodyweight".
+        #   Weighted kg:
+        #       intensityValue   = round(kg × 1000), intensityPercent = 0
+        #       intensityDisplayUnit = "6", intensityCustom = 0
+        #   Weighted lbs:
+        #       intensityValue   = round(lbs × 0.45359237 × 1000)
+        #       intensityPercent = round(lbs × 1_000_000)
+        #       intensityDisplayUnit = "7", intensityCustom = 0
+        #   weight_kg=0 explicitly → renders "0.00 kg" (intensityValue=0,
+        #   intensityCustom=0). Distinct from bodyweight.
+        #
+        # round() (not int()) because float multiplications can land just
+        # below the integer boundary (e.g. 27.9 * 1000 → 27899.999...).
+        weight_kg = ex.get("weight_kg")
+        weight_lbs = ex.get("weight_lbs")
+        if weight_kg is not None and weight_lbs is not None:
+            raise ValueError(
+                "exercise specifies both weight_kg and weight_lbs — pick one"
+            )
+        if weight_lbs is not None:
+            weight_lbs = float(weight_lbs)
+            if weight_lbs < 0:
+                raise ValueError(
+                    f"weight_lbs must be non-negative, got {weight_lbs}"
+                )
+            intensity_value: int | str = round(weight_lbs * _LB_TO_KG * 1000)
+            intensity_percent = round(weight_lbs * 1_000_000)
+            display_unit = "7"
+            intensity_custom = 0
+        elif weight_kg is not None:
+            weight_kg = float(weight_kg)
+            if weight_kg < 0:
+                raise ValueError(
+                    f"weight_kg must be non-negative, got {weight_kg}"
+                )
+            intensity_value = round(weight_kg * 1000)
+            intensity_percent = 0
+            display_unit = "6"
+            intensity_custom = 0
+        else:
+            # Bodyweight — empty string is the iOS-app marker.
+            intensity_value = ""
+            intensity_percent = 0
+            display_unit = "6"
+            intensity_custom = 1
+
+        total_duration += ((target_value if ex["target_type"] == 2 else 0) + rest) * ex_sets
+
+        cat = by_id.get(str(ex["origin_id"]), {})
+        muscle = cat.get("muscle") or []
+        muscle_relevance = cat.get("muscleRelevance") or []
+        part = cat.get("part") or []
+        equipment = cat.get("equipment") or []
+        animation_id = cat.get("animationId", 0)
+
+        built.append({
+            "animationId": animation_id,
+            "exerciseKind": 0,
+            "exerciseType": 2,
+            "gradeSystem": 0,
+            "groupId": "0",
+            "hrType": 0,
+            "intensityCustom": intensity_custom,
+            "intensityDisplayUnit": display_unit,
+            "intensityMultiplier": 0,
+            "intensityPercent": intensity_percent,
+            "intensityPercentExtend": 0,
+            "intensityType": 1,
+            "intensityValue": intensity_value,
+            "intensityValueExtend": 0,
+            "isDefaultAdd": 0,
+            "isGroup": False,
+            "isIntensityPercent": False,
+            "muscle": muscle,
+            "muscleRelevance": muscle_relevance,
+            "name": ex.get("name", ""),
+            "onsightGradeOffset": 0,
+            "originId": ex["origin_id"],
+            "overview": ex.get("overview", "sid_strength_training"),
+            "part": part,
+            "equipment": equipment,
+            "packageTime": 0,
+            "restType": rest_type,
+            "restValue": rest_value,
+            "sets": ex_sets,
+            "sourceId": "0",
+            "sportType": 4,
+            "status": 1,
+            "subType": 0,
+            "targetDisplayUnit": 0,
+            "targetType": ex["target_type"],
+            "targetValue": target_value,
+        })
+
+    total_duration *= sets
+    payload = {
+        "duration": total_duration,
+        "exerciseNum": len(exercises),
+        "exercises": built,
+        "gradeSystemVersion": 0,
+        "hybridTotalSets": 0,
+        "name": name,
+        "overview": "",
+        # pool* fields are pool-swim metadata, irrelevant for strength
+        # (sportType=4). The Coros app sets them to 0 on strength workouts.
+        "poolLength": 0,
+        "poolLengthId": 0,
+        "poolLengthUnit": 0,
+        "referExercise": {"gradeSystem": 0, "hrType": 0, "intensityType": 0, "valueType": 1},
+        "sets": sets,
+        "sourceUrl": "",
+        "sportType": 4,
+        "subType": 65535,
+        "totalSets": sets,
+        "trainingLoad": 0,
+        "type": 0,
+        "videoCoverUrl": "",
+        "videoUrl": "",
+    }
+    return payload
+
+
+async def save_strength_workout_template(
     auth: StoredAuth,
     name: str,
     exercises: list[dict],
     sets: int = 1,
 ) -> str:
     """
-    Create a new structured strength workout program.
+    Save a reusable strength workout template to the Coros library.
 
     exercises: list of dicts with keys:
       - origin_id: str  — exercise catalogue ID (from list_exercises)
@@ -1420,106 +1675,21 @@ async def create_strength_workout(
       - overview: str   — sid_ key (e.g. "sid_strength_squats")
       - target_type: int — 2=time (seconds), 3=reps
       - target_value: int — seconds or reps
-      - rest_seconds: int — rest after this exercise
+      - rest_seconds: int — rest after this exercise. 0 → "Skip rests".
+      - weight_kg: float (optional) — prescribed weight in kg.
+      - weight_lbs: float (optional) — prescribed weight in pounds.
+        Mutually exclusive with weight_kg; pick one.
+        Omitting BOTH renders as "Bodyweight" in the app.
+        Explicit weight_kg=0 renders as "0.00 kg" — different from omitting.
+        For dumbbell exercises, by convention this is the per-hand weight.
+        The Coros app does not render ranges — single values only.
 
     sets: number of circuit repetitions.
 
     Returns the new workout ID.
     """
-    sets = max(1, sets)
-    built = []
-    total_duration = 0
-    for i, ex in enumerate(exercises):
-        target_value = ex["target_value"]
-        rest = ex.get("rest_seconds", 60)
-        ex_sets = max(1, int(ex.get("sets", 1)))
-        total_duration += ((target_value if ex["target_type"] == 2 else 0) + rest) * ex_sets
-        built.append({
-            "access": 0,
-            "createTimestamp": 0,
-            "defaultOrder": i,
-            "exerciseType": 2,
-            "id": i + 1,
-            "intensityCustom": 0,
-            "intensityDisplayUnit": "6",
-            "intensityMultiplier": 0,
-            "intensityPercent": 0,
-            "intensityPercentExtend": 0,
-            "intensityType": 1,
-            "intensityValue": 0,
-            "intensityValueExtend": 0,
-            "isDefaultAdd": 0,
-            "isGroup": False,
-            "isIntensityPercent": False,
-            "hrType": 0,
-            "name": ex.get("name", ""),
-            "originId": ex["origin_id"],
-            "overview": ex.get("overview", "sid_strength_training"),
-            "part": [0],
-            "groupId": "",
-            "restType": 1,
-            "restValue": rest,
-            "sets": ex_sets,
-            "sortNo": i,
-            "sourceUrl": "",
-            "sportType": 4,
-            "status": 1,
-            "targetDisplayUnit": 0,
-            "targetType": ex["target_type"],
-            "targetValue": target_value,
-            "userId": 0,
-            "videoInfos": [],
-            "videoUrl": "",
-        })
-
-    total_duration *= sets
-    payload = {
-        "access": 1,
-        "authorId": "0",
-        "createTimestamp": 0,
-        "distance": "0",
-        "duration": total_duration,
-        "essence": 0,
-        "estimatedType": 0,
-        "estimatedValue": 0,
-        "exerciseNum": len(exercises),
-        "exercises": built,
-        "headPic": "",
-        "id": "0",
-        "idInPlan": "0",
-        "name": name,
-        "nickname": "",
-        "originEssence": 0,
-        "overview": "",
-        "pbVersion": 2,
-        "pitch": 0,
-        "planIdIndex": 0,
-        "poolLength": 2500,
-        "poolLengthId": 1,
-        "poolLengthUnit": 2,
-        "profile": "",
-        "referExercise": {"intensityType": 1, "hrType": 0, "valueType": 1},
-        "sex": 0,
-        "sets": sets,
-        "shareUrl": "",
-        "simple": False,
-        "sourceId": "425868113867882496",
-        "sourceUrl": "",
-        "sportType": 4,
-        "star": 0,
-        "subType": 65535,
-        "targetType": 0,
-        "targetValue": 0,
-        "thirdPartyId": 0,
-        "totalSets": sets,
-        "trainingLoad": 0,
-        "type": 0,
-        "unit": 0,
-        "userId": "0",
-        "version": 0,
-        "videoCoverUrl": "",
-        "videoUrl": "",
-    }
+    by_id = await _load_strength_catalog(auth)
+    payload = _build_strength_program_payload(name, exercises, by_id, sets)
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -1535,8 +1705,11 @@ async def create_strength_workout(
     return str(body.get("data", ""))
 
 
-async def _fetch_raw_workout(auth: StoredAuth, workout_id: str) -> Optional[dict]:
-    """Return the raw workout object for a given ID from the workout list."""
+async def _fetch_raw_workout(auth: StoredAuth, workout_id: str) -> dict | None:
+    """Return the raw workout object for a given ID from the workout list.
+    Returns None only when the list call succeeds but the ID is absent —
+    API-level errors raise via _check_response so callers don't confuse
+    'API broke' with 'not in library'."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             _base_url(auth.region) + ENDPOINTS["workout_list"],
@@ -1545,64 +1718,55 @@ async def _fetch_raw_workout(auth: StoredAuth, workout_id: str) -> Optional[dict
         )
         resp.raise_for_status()
         body = resp.json()
+    _check_response(body, "workout list")
     for w in body.get("data", []):
         if str(w.get("id", "")) == str(workout_id):
             return w
     return None
 
 
-async def schedule_workout(
+async def _post_schedule_inline(
     auth: StoredAuth,
-    workout_id: str,
+    program: dict,
     happen_day: str,
     sort_no: int = 1,
-) -> None:
+) -> dict:
+    """Resolve next idInPlan + POST /training/schedule/update with the program
+    embedded inline, then GET the schedule again to surface server-assigned
+    identifiers. Returns a 5-key dict: plan_id, id_in_plan, plan_program_id,
+    entity_id (all strings) and enrichment_ok (bool). On enrichment failure
+    the schedule POST has already succeeded — only id_in_plan is populated,
+    the other three string IDs are empty and enrichment_ok is False so the
+    caller can surface a warning instead of piping empty IDs straight into
+    remove_scheduled_workout.
+
+    NOTE: idInPlan is resolved as maxIdInPlan + 1 from the pre-POST schedule
+    GET. This is racy under concurrent calls for the same happen_day —
+    pre-existing behavior, acceptable for single-user MCP. Do not call this
+    in parallel for the same date.
     """
-    Add an existing workout to the Coros training calendar.
-
-    happen_day: YYYYMMDD string.
-    sort_no: order within the day (1 = first workout).
-    """
-    # Get raw workout object
-    program = await _fetch_raw_workout(auth, workout_id)
-    if program is None:
-        raise ValueError(f"Workout {workout_id} not found in library.")
-
-    # Fetch schedule to get maxIdInPlan (raw, not stripped)
-    params = {
-        "startDate": happen_day,
-        "endDate": happen_day,
-        "supportRestExercise": 1,
-    }
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            _base_url(auth.region) + ENDPOINTS["schedule"],
-            params=params,
-            headers=_auth_headers(auth),
-        )
-        resp.raise_for_status()
-        schedule_body = resp.json()
+        pre_data = await _fetch_schedule_data(client, auth, happen_day, happen_day)
+        try:
+            id_in_plan = int(pre_data.get("maxIdInPlan", 0)) + 1
+        except (TypeError, ValueError):
+            id_in_plan = 1
 
-    raw_data = schedule_body.get("data") or {}
-    try:
-        id_in_plan = int(raw_data.get("maxIdInPlan", 0)) + 1
-    except (TypeError, ValueError):
-        id_in_plan = 1
+        program_with_id = {**program, "idInPlan": id_in_plan}
 
-    program["idInPlan"] = id_in_plan
+        # pbVersion=2 + versionObjects status=1 reverse-engineered from iOS;
+        # status=3 is the delete marker (see remove_scheduled_workout).
+        payload = {
+            "entities": [{
+                "happenDay": happen_day,
+                "idInPlan": id_in_plan,
+                "sortNoInSchedule": sort_no,
+            }],
+            "programs": [program_with_id],
+            "versionObjects": [{"id": id_in_plan, "status": 1}],
+            "pbVersion": 2,
+        }
 
-    payload = {
-        "entities": [{
-            "happenDay": happen_day,
-            "idInPlan": id_in_plan,
-            "sortNoInSchedule": sort_no,
-        }],
-        "programs": [program],
-        "versionObjects": [{"id": id_in_plan, "status": 1}],
-        "pbVersion": 2,
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             _base_url(auth.region) + ENDPOINTS["schedule_update"],
             json=payload,
@@ -1610,15 +1774,109 @@ async def schedule_workout(
         )
         resp.raise_for_status()
         body = resp.json()
+        _check_response(body, "schedule update")
 
-    _check_response(body, "schedule update")
+        # schedule/update's response omits the identifiers that
+        # remove_scheduled_workout requires; re-fetch and locate our entry
+        # by client-computed idInPlan (unique within a plan). Best-effort:
+        # POST already succeeded, lookup failure must not propagate as a
+        # schedule failure.
+        result = {
+            "plan_id": "",
+            "id_in_plan": str(id_in_plan),
+            "plan_program_id": "",
+            "entity_id": "",
+            "enrichment_ok": False,
+        }
+        try:
+            post_data = await _fetch_schedule_data(client, auth, happen_day, happen_day)
+            for entity in post_data.get("entities") or []:
+                if str(entity.get("idInPlan", "")) == str(id_in_plan):
+                    result["plan_id"] = str(post_data.get("id", ""))
+                    result["id_in_plan"] = str(entity.get("idInPlan", id_in_plan))
+                    result["plan_program_id"] = str(entity.get("planProgramId", ""))
+                    result["entity_id"] = str(entity.get("id", ""))
+                    result["enrichment_ok"] = bool(
+                        result["plan_id"]
+                        and result["plan_program_id"]
+                        and result["entity_id"]
+                    )
+                    break
+        except (httpx.HTTPError, ValueError):
+            pass
+
+    return result
+
+
+async def schedule_workout_template(
+    auth: StoredAuth,
+    workout_id: str,
+    happen_day: str,
+    sort_no: int = 1,
+) -> dict:
+    """
+    Add an existing library workout template to the Coros training calendar.
+
+    happen_day: YYYYMMDD string.
+    sort_no: order within the day (1 = first workout).
+
+    Returns the server response 'data' dict (shape depends on Coros API).
+    """
+    program = await _fetch_raw_workout(auth, workout_id)
+    if program is None:
+        raise ValueError(f"Workout {workout_id} not found in library.")
+    return await _post_schedule_inline(auth, program, happen_day, sort_no)
+
+
+async def schedule_workout(
+    auth: StoredAuth,
+    name: str,
+    steps: list[dict],
+    happen_day: str,
+    sport_type: int = 2,
+    intensity_type: int | None = None,
+    sort_no: int = 1,
+) -> dict:
+    """
+    Build + schedule a one-off cycling/intervals workout for happen_day.
+    Does NOT persist a library entry — the program is embedded inline
+    in the schedule POST.
+
+    steps: same shape as save_workout_template (plain steps or repeat groups).
+
+    Returns the server response 'data' dict (shape depends on Coros API).
+    """
+    program = _build_workout_program_payload(name, steps, sport_type, intensity_type)
+    return await _post_schedule_inline(auth, program, happen_day, sort_no)
+
+
+async def schedule_strength_workout(
+    auth: StoredAuth,
+    name: str,
+    exercises: list[dict],
+    happen_day: str,
+    sets: int = 1,
+    sort_no: int = 1,
+) -> dict:
+    """
+    Build + schedule a one-off strength workout for happen_day. Does NOT
+    persist a library entry — the program is embedded inline in the
+    schedule POST.
+
+    exercises: same shape as save_strength_workout_template. Empty list raises.
+
+    Returns the server response 'data' dict (shape depends on Coros API).
+    """
+    by_id = await _load_strength_catalog(auth)
+    program = _build_strength_program_payload(name, exercises, by_id, sets)
+    return await _post_schedule_inline(auth, program, happen_day, sort_no)
 
 
 async def remove_scheduled_workout(
     auth: StoredAuth,
     plan_id: str,
     id_in_plan: str,
-    plan_program_id: Optional[str] = None,
+    plan_program_id: str | None = None,
 ) -> None:
     """
     Remove a scheduled workout from the Coros training calendar.
@@ -1648,6 +1906,84 @@ async def remove_scheduled_workout(
     _check_response(body, "schedule delete")
 
 
+async def _post_schedule_update(auth: StoredAuth, payload: dict) -> None:
+    """POST a versioned payload to /training/schedule/update."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            _base_url(auth.region) + ENDPOINTS["schedule_update"],
+            json=payload,
+            headers=_auth_headers(auth),
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+    _check_response(body, "schedule update")
+
+
+async def add_planned_workout(
+    auth: StoredAuth,
+    entity: dict,
+    program: dict,
+    version_object: dict | None = None,
+) -> None:
+    """
+    Add a planned workout to the training calendar from a raw entity/program.
+
+    This mirrors the Training Hub schedule/update payload used when adding an
+    inline workout that is not first fetched from the workout library.
+    """
+    id_in_plan = entity.get("idInPlan") or program.get("idInPlan")
+    if id_in_plan is None:
+        raise ValueError("entity/program must include idInPlan for schedule add")
+
+    # Copy rather than mutate the caller's program dict.
+    program = {**program, "idInPlan": program.get("idInPlan", id_in_plan)}
+    payload = {
+        "entities": [entity],
+        "programs": [program],
+        "versionObjects": [version_object or {"id": id_in_plan, "status": 1}],
+        "pbVersion": 2,
+    }
+    await _post_schedule_update(auth, payload)
+
+
+async def update_scheduled_workout(
+    auth: StoredAuth,
+    entity: dict,
+    program: dict,
+    version_object: dict | None = None,
+) -> None:
+    """
+    Update an existing planned workout on the training calendar.
+
+    This uses the same /training/schedule/update endpoint as scheduling and
+    deletion, but sends versionObjects.status=2. The entity/program should come
+    from fetch_schedule_raw(), with any intended edits applied. If the program
+    content changes, call calculate_workout_program() first and pass the
+    calculated program here.
+    """
+    id_in_plan = str(entity.get("idInPlan") or program.get("idInPlan") or "")
+    plan_id = str(entity.get("planId") or program.get("planId") or "")
+    plan_program_id = str(entity.get("planProgramId") or program.get("planProgramId") or "")
+    if not id_in_plan or not plan_id:
+        raise ValueError("entity/program must include idInPlan and planId for schedule update")
+
+    payload = {
+        "entities": [entity],
+        "programs": [program],
+        "versionObjects": [
+            version_object or {
+                "id": id_in_plan,
+                "status": 2,
+                "planProgramId": plan_program_id,
+                "planId": plan_id,
+            }
+        ],
+        "pbVersion": 2,
+    }
+    await _post_schedule_update(auth, payload)
+
+
 async def fetch_exercises(auth: StoredAuth, sport_type: int) -> list[dict]:
     """
     Fetch the exercise catalogue for a given sport type.
@@ -1656,7 +1992,7 @@ async def fetch_exercises(auth: StoredAuth, sport_type: int) -> list[dict]:
     strength) that appear in planned workouts but have no inline detail.
     Returns the raw list of exercise definitions.
     """
-    params = {"userId": auth.user_id, "sportType": sport_type}
+    params: dict[str, str | int] = {"userId": auth.user_id, "sportType": sport_type}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             _base_url(auth.region) + ENDPOINTS["exercises"],
@@ -1713,6 +2049,7 @@ async def _refresh_mobile_token(auth: StoredAuth) -> bool:
         _save_auth(auth)
         return True
     except Exception:
+        logger.debug("Mobile token refresh via replay payload failed", exc_info=True)
         return False
 
 
@@ -1735,9 +2072,8 @@ async def _ensure_mobile_token(auth: StoredAuth) -> bool:
         return True
 
     # Try refreshing via the stored encrypted payload (avoids re-entering creds)
-    if auth.mobile_login_payload:
-        if await _refresh_mobile_token(auth):
-            return True
+    if auth.mobile_login_payload and await _refresh_mobile_token(auth):
+        return True
 
     # Fall back to a fresh mobile login using env credentials
     creds = get_env_credentials()
@@ -1751,6 +2087,7 @@ async def _ensure_mobile_token(auth: StoredAuth) -> bool:
         _save_auth(auth)
         return True
     except Exception:
+        logger.debug("Fresh mobile login from env credentials failed", exc_info=True)
         return False
 
 
@@ -1770,7 +2107,7 @@ async def fetch_sleep(auth: StoredAuth, start_day: str, end_day: str) -> list[Sl
     """
     if not await _ensure_mobile_token(auth):
         raise ValueError(
-            "No mobile API token available. Set credentials in ~/.config/coros-mcp/.env "
+            "No mobile API token available. Set COROS_EMAIL and COROS_PASSWORD in .env "
             "for automatic acquisition, or run: coros-mcp auth-mobile"
         )
 
@@ -1787,6 +2124,10 @@ async def fetch_sleep(auth: StoredAuth, start_day: str, end_day: str) -> list[Sl
 
     async def _do_request(token: str) -> dict:
         async with httpx.AsyncClient(timeout=30) as client:
+            # Token is sent both as query param and header because the mobile
+            # app does the same — untested whether the header alone suffices.
+            # Note: the query param means the token appears in URLs (and thus
+            # in any intermediate proxy logs).
             resp = await client.post(
                 url,
                 params={"accessToken": token},
@@ -1796,14 +2137,14 @@ async def fetch_sleep(auth: StoredAuth, start_day: str, end_day: str) -> list[Sl
             resp.raise_for_status()
             return resp.json()
 
-    body = await _do_request(auth.mobile_access_token)
+    token = auth.mobile_access_token
+    assert token is not None  # guaranteed by _ensure_mobile_token above
+    body = await _do_request(token)
 
-    if body.get("result") == "1019":  # token expired — auto-refresh once
-        if await _refresh_mobile_token(auth):
-            body = await _do_request(auth.mobile_access_token)
+    if body.get("result") == "1019" and await _refresh_mobile_token(auth):  # token expired — auto-refresh once
+        body = await _do_request(auth.mobile_access_token or token)
 
-    if body.get("result") != "0000":
-        raise ValueError(f"Coros sleep API error: {body.get('message', 'unknown error')}")
+    _check_response(body, "sleep")
 
     records: list[SleepRecord] = []
     for item in body.get("data", {}).get("statisticData", {}).get("dayDataList", []):
