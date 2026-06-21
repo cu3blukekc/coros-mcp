@@ -104,19 +104,7 @@ Or add to Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_c
 
 #### Step 3: Authenticate
 
-**Option A — `.env` file (recommended for project-scoped setups):**
-
-Create a `.env` file in your project directory:
-
-```
-COROS_EMAIL=you@example.com
-COROS_PASSWORD=yourpassword
-COROS_REGION=eu
-```
-
-The server authenticates automatically on the first request and re-authenticates transparently whenever the token expires. No manual auth step needed.
-
-**Option B — Manual authentication:**
+**Option A — CLI authentication (recommended):**
 
 Run the following command in your terminal — **outside** of any Claude session:
 
@@ -124,9 +112,42 @@ Run the following command in your terminal — **outside** of any Claude session
 coros-mcp auth
 ```
 
-You will be prompted for your email, password, and region (`eu`, `us`, or `asia`). This stores both the Training Hub web token and the mobile API token (used for sleep data). Your credentials are sent directly to Coros and the tokens are stored securely in your system keyring (or an encrypted local file as fallback). **You only need to do this once** — the tokens persist across restarts.
+You will be prompted for your email, password, and region (`eu`, `us`, or `asia`). This stores both the Training Hub web token and the mobile API token (used for sleep data). Your credentials are sent directly to Coros and the tokens are stored securely in `~/.config/coros-mcp/` (encrypted file) and your system keyring. **You only need to do this once** — the tokens persist across restarts and are never written into your project or Obsidian vault.
 
 > **Note:** The mobile login (`apieu.coros.com`) will log you out of the Coros mobile app on your phone. If you want to avoid this, use `coros-mcp auth-web` instead — it stores only the web token, and the mobile token will be obtained automatically when you first request sleep data.
+
+**Option B — Headless auto-login (optional):**
+
+For servers or CI where interactive `coros-mcp auth` is not practical, copy [`auth/env.example`](auth/env.example) to `~/.config/coros-mcp/.env`:
+
+```
+COROS_EMAIL=you@example.com
+COROS_PASSWORD=yourpassword
+COROS_REGION=eu
+```
+
+The server authenticates automatically on the first request and re-authenticates when the token expires. **Do not** put this file inside a git repository or Obsidian vault.
+
+#### Obsidian / git-synced vaults
+
+If your vault (or project) is a git repository:
+
+1. Run `coros-mcp auth` once in a terminal — tokens live in `~/.config/coros-mcp/`, not in the vault.
+2. Add MCP **without** credentials in the config:
+
+```json
+{
+  "mcpServers": {
+    "coros": {
+      "command": "/path/to/coros-mcp/.venv/bin/coros-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+3. **Never** use `claude mcp add -e COROS_PASSWORD=...` with `--scope project` — that writes the password into `.cursor/mcp.json` inside the vault.
+4. **Never** keep a project-local `.env` with `COROS_PASSWORD` in the vault; legacy project `.env` files are migrated to `~/.config/coros-mcp/.env` on first run with a warning.
 
 **Other auth commands:**
 

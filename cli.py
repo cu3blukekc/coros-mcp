@@ -1,8 +1,10 @@
 """CLI commands for Coros MCP Server."""
 import asyncio
 import getpass
+import os
 import sys
 import time
+from pathlib import Path
 
 from auth.storage import clear_token, get_token, is_keyring_available
 from coros_api import TOKEN_TTL_MS, get_stored_auth, try_auto_login, login, login_mobile
@@ -10,19 +12,25 @@ from coros_api import TOKEN_TTL_MS, get_stored_auth, try_auto_login, login, logi
 
 def _prompt_credentials() -> tuple[str, str, str]:
     """Prompt for email, password, and region. Returns (email, password, region)."""
-    email = input("Email: ").strip()
+    default_email = os.environ.get("COROS_EMAIL", "").strip()
+    default_region = os.environ.get("COROS_REGION", "eu").strip().lower() or "eu"
+
+    email_prompt = f"Email [{default_email}]: " if default_email else "Email: "
+    email = input(email_prompt).strip() or default_email
     if not email:
         print("Error: email is required.")
         sys.exit(1)
 
-    password = getpass.getpass("Password: ")
+    password = os.environ.get("COROS_PASSWORD", "").strip()
+    if not password:
+        password = getpass.getpass("Password: ")
     if not password:
         print("Error: password is required.")
         sys.exit(1)
 
     print()
     print("Region options: eu, us, asia")
-    region = input("Region [eu]: ").strip().lower() or "eu"
+    region = input(f"Region [{default_region}]: ").strip().lower() or default_region
     if region not in ("eu", "us", "asia"):
         print(f"Warning: unknown region '{region}', using it anyway.")
     return email, password, region
@@ -162,7 +170,10 @@ def cmd_sync() -> int:
     if auth is None:
         auth = asyncio.run(try_auto_login())
     if auth is None:
-        print("✗ Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env, or run 'coros-mcp auth'.")
+        print(
+            "✗ Not authenticated. Run 'coros-mcp auth', or set credentials in "
+            "~/.config/coros-mcp/.env."
+        )
         return 1
 
     range_str = f"{start_day} → {end_day}" if end_day else f"{start_day} → today"
@@ -242,8 +253,9 @@ Usage:
 
 
 def main() -> None:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from auth.env import load_coros_env
+
+    load_coros_env(legacy_project_dir=Path(__file__).resolve().parent)
 
     command = sys.argv[1] if len(sys.argv) > 1 else "help"
     commands = {

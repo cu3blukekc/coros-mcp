@@ -2,25 +2,19 @@
 Coros MCP Server — Sleep, HRV, and training data via the unofficial Coros API.
 
 Usage:
-    python server.py
+    coros-mcp serve
 
 MCP config (Claude Code):
-    claude mcp add coros \\
-      -e COROS_EMAIL=you@example.com \\
-      -e COROS_PASSWORD=yourpass \\
-      -e COROS_REGION=eu \\
-      -- python /path/to/coros-mcp/server.py
+    coros-mcp auth   # once — stores tokens outside the vault/repo
+    claude mcp add coros -- /path/to/coros-mcp/.venv/bin/coros-mcp serve
 
-Alternatively, create a .env file in the project directory with the same
-variables. If COROS_EMAIL and COROS_PASSWORD are set (via env or .env), the
-server authenticates automatically on the first request and re-authenticates
-transparently whenever the stored token is expired or rejected.
+Do not put COROS_PASSWORD in project-scoped MCP config or vault .env files.
+Optional headless credentials: ~/.config/coros-mcp/.env
 """
 
 import time
 from datetime import datetime, timedelta
 
-from dotenv import load_dotenv
 from fastmcp import FastMCP
 
 import coros_api
@@ -34,7 +28,6 @@ from cache.sync import (
     sync_all as _sync_all,
 )
 
-load_dotenv()
 init_db()
 
 mcp = FastMCP("coros-mcp")
@@ -60,18 +53,18 @@ async def _run_with_auth(fn, auth, *args, **kwargs):
 
 
 def _summarize_steps(steps: list[dict]) -> tuple[float, int]:
-    """Return (total_minutes, steps_count) for a workout step list."""
-    total_minutes = 0.0
+    """Return (estimated_total_minutes, steps_count) for a workout step list."""
+    total_seconds = 0
     steps_count = 0
     for s in steps:
         if "repeat" in s:
-            sub_mins = sum(sub["duration_minutes"] for sub in s["steps"])
-            total_minutes += sub_mins * s["repeat"]
+            sub_sec = sum(coros_api._resolve_step_target(sub)[2] for sub in s["steps"])
+            total_seconds += sub_sec * s["repeat"]
             steps_count += 1 + len(s["steps"])
         else:
-            total_minutes += s["duration_minutes"]
+            total_seconds += coros_api._resolve_step_target(s)[2]
             steps_count += 1
-    return total_minutes, steps_count
+    return round(total_seconds / 60, 1), steps_count
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +79,7 @@ async def get_help() -> dict:
             {"name": "get_help", "description": "List all available tools (this tool)"},
             {"name": "authenticate_coros", "description": "Log in with email/password; stores web API token (required before all data tools)"},
             {"name": "authenticate_coros_mobile", "description": "Add mobile token for sleep stage data (deep/light/REM/awake)"},
-            {"name": "check_coros_auth", "description": "Show current auth status, region, and token expiry"},
+            {"name": "check_coros_auth", "description": "Auth status; auto web-login from ~/.config/coros-mcp/.env when token missing/expired"},
             {"name": "get_daily_metrics", "description": "Fetch daily training metrics: HRV, sleep hours, steps, stress, resting HR, VO2max, fitness score"},
             {"name": "get_dashboard_snapshot", "description": "Dashboard snapshot: running form, recovery, race predictions, summaryInfo keys"},
             {"name": "get_sleep_data", "description": "Fetch nightly sleep records with duration and quality score (mobile auth required for stage breakdown)"},
@@ -197,22 +190,28 @@ async def authenticate_coros_mobile(
 # Tool: check_coros_auth
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def check_coros_auth() -> dict:
-    """
-    Check whether valid Coros access tokens are stored locally.
+def _env_credentials_configured() -> bool:
+    return coros_api.get_env_credentials() is not None
 
-    Returns
-    -------
-    dict with keys: authenticated, user_id, region, expires_in_hours,
-    mobile_authenticated, mobile_token_status
-    """
-    auth = coros_api.get_stored_auth()
+
+def _mobile_auto_login_available(auth) -> bool:
+    if auth and auth.mobile_login_payload:
+        return True
+    return _env_credentials_configured()
+
+
+def _auth_status_dict(auth) -> dict:
+    auto_login_available = _env_credentials_configured()
     if auth is None:
         return {
             "authenticated": False,
             "mobile_authenticated": False,
-            "message": "No valid token found. Call authenticate_coros first.",
+            "auto_login_available": auto_login_available,
+            "mobile_auto_login_available": auto_login_available,
+            "message": (
+                "No valid token found. Run `coros-mcp auth`, or set credentials in "
+                "~/.config/coros-mcp/.env, or call authenticate_coros."
+            ),
         }
 
     age_ms = int(time.time() * 1000) - auth.timestamp
@@ -225,7 +224,7 @@ async def check_coros_auth() -> dict:
     elif auth.mobile_login_payload:
         mobile_status = "expired (can auto-refresh)"
     else:
-        mobile_status = "missing (run auth or auth-mobile)"
+        mobile_status = "missing (lazy login on get_sleep_data if credentials configured)"
 
     return {
         "authenticated": bool(auth.access_token),
@@ -234,7 +233,30 @@ async def check_coros_auth() -> dict:
         "expires_in_hours": remaining_hours,
         "mobile_authenticated": has_mobile,
         "mobile_token_status": mobile_status,
+        "auto_login_available": auto_login_available,
+        "mobile_auto_login_available": _mobile_auto_login_available(auth),
     }
+
+
+@mcp.tool()
+async def check_coros_auth() -> dict:
+    """
+    Check whether valid Coros access tokens are stored locally.
+
+    Attempts automatic web login from ~/.config/coros-mcp/.env when the stored
+    token is missing or expired. Mobile tokens are acquired lazily on
+    get_sleep_data (not here).
+
+    Returns
+    -------
+    dict with keys: authenticated, user_id, region, expires_in_hours,
+    mobile_authenticated, mobile_token_status, auto_login_available,
+    mobile_auto_login_available
+    """
+    auth = coros_api.get_stored_auth()
+    if auth is None:
+        auth = await coros_api.try_auto_login()
+    return _auth_status_dict(auth)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +303,7 @@ async def get_daily_metrics(weeks: int = 4) -> dict:
     auth = await _get_auth()
     if auth is None:
         return {
-            "error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.",
+            "error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.",
             "records": [],
         }
 
@@ -317,7 +339,7 @@ async def get_dashboard_snapshot() -> dict:
     auth = await _get_auth()
     if auth is None:
         return {
-            "error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.",
+            "error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.",
         }
     try:
         snapshot = await _run_with_auth(coros_api.fetch_dashboard_snapshot, auth)
@@ -363,7 +385,7 @@ async def get_sleep_data(weeks: int = 4) -> dict:
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.", "records": []}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.", "records": []}
 
     weeks = max(1, min(weeks, 52))
     end_dt = datetime.now(tz=LOCAL_TZ) if LOCAL_TZ is not None else datetime.now()
@@ -419,7 +441,7 @@ async def list_activities(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.", "activities": []}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.", "activities": []}
     try:
         activities, total = await _run_with_auth(fetch_activities_cached, auth, start_day, end_day, page, size)
         result = []
@@ -461,7 +483,7 @@ async def get_activity_detail(activity_id: str, sport_type: int = 0) -> dict:
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
         return await _run_with_auth(coros_api.fetch_activity_detail, auth, activity_id, sport_type)
     except Exception as exc:
@@ -486,7 +508,7 @@ async def list_workouts() -> dict:
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.", "workouts": []}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.", "workouts": []}
     try:
         workouts = await _run_with_auth(coros_api.fetch_workouts, auth)
         return {"workouts": workouts, "count": len(workouts)}
@@ -519,8 +541,11 @@ async def create_workout(
         List of workout steps. Each step is either a plain step or a repeat group.
 
         Plain step:
-        - name (str): step label, e.g. "10:00 Einfahren"
-        - duration_minutes (float): step duration in minutes
+        - name (str): step label, e.g. "14 km easy"
+        - distance_km (float): **preferred for running** — goal by distance (Coros «Расстояние»)
+        - distance_meters (int): alternative to distance_km
+        - duration_minutes (float): time goal — short rests between intervals, not full easy runs
+        - pace_sec_per_km (int): optional; rough duration estimate when using distance
         - intensity_low (int): lower intensity target (watts, BPM, etc. depending on intensity_type)
         - intensity_high (int): upper intensity target (0 = open-ended)
         Note: power_low_w / power_high_w are accepted as legacy aliases for intensity_low / intensity_high.
@@ -552,9 +577,11 @@ async def create_workout(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
-        workout_id = await _run_with_auth(coros_api.create_workout, auth, name, steps, sport_type, intensity_type)
+        workout_id = await _run_with_auth(
+            coros_api.create_workout, auth, name, steps, sport_type, intensity_type
+        )
         total_minutes, steps_count = _summarize_steps(steps)
         return {
             "workout_id": workout_id,
@@ -589,7 +616,7 @@ async def delete_workout(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
         await _run_with_auth(coros_api.delete_workout, auth, workout_id)
         return {
@@ -627,7 +654,7 @@ async def list_planned_activities(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.", "schedule": {}}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.", "schedule": {}}
     try:
         items = await _run_with_auth(coros_api.fetch_schedule, auth, start_day, end_day)
         return {
@@ -667,7 +694,7 @@ async def schedule_workout(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
         await _run_with_auth(coros_api.schedule_workout, auth, workout_id, happen_day, sort_no)
         return {"scheduled": True, "workout_id": workout_id, "happen_day": happen_day}
@@ -703,7 +730,7 @@ async def remove_scheduled_workout(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
         await _run_with_auth(
             coros_api.remove_scheduled_workout, auth, plan_id, id_in_plan, plan_program_id or None
@@ -750,7 +777,7 @@ async def create_strength_workout(
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
     try:
         workout_id = await _run_with_auth(coros_api.create_strength_workout, auth, name, exercises, sets)
         return {
@@ -786,7 +813,7 @@ async def list_exercises(sport_type: int = 4) -> dict:
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD in .env or call authenticate_coros.", "exercises": []}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros.", "exercises": []}
     try:
         items = await _run_with_auth(coros_api.fetch_exercises, auth, sport_type)
         return {"exercises": items, "count": len(items), "sport_type": sport_type}
@@ -829,7 +856,7 @@ async def sync_coros_data(start_day: str = "", end_day: str = "") -> dict:
     """
     auth = await _get_auth()
     if auth is None:
-        return {"error": "Not authenticated. Set COROS_EMAIL and COROS_PASSWORD or call authenticate_coros."}
+        return {"error": "Not authenticated. Run `coros-mcp auth`, or set credentials in `~/.config/coros-mcp/.env`, or call authenticate_coros."}
 
     if not start_day:
         start_day = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
@@ -867,6 +894,9 @@ async def get_cache_status() -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
+    from auth.env import load_coros_env
+
+    load_coros_env()
     mcp.run()
 
 

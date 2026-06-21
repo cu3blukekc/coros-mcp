@@ -16,9 +16,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from auth.keyring_store import CredentialResult
-
-CONFIG_DIR = Path.home() / ".config" / "coros-mcp"
-CREDENTIALS_FILE = CONFIG_DIR / "auth.enc"
+from auth.paths import CONFIG_DIR, CREDENTIALS_FILE
 
 
 @functools.lru_cache(maxsize=1)

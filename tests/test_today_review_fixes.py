@@ -246,25 +246,24 @@ class TestCmdSyncArgparse:
 
 
 # ---------------------------------------------------------------------------
-# 6. load_dotenv not called at import time
+# 6. load_coros_env not called at import time
 # ---------------------------------------------------------------------------
 
-class TestLoadDotenvNotAtImport:
+class TestLoadCorosEnvNotAtImport:
 
-    def test_import_cli_does_not_call_load_dotenv(self):
-        """Importing cli must not trigger load_dotenv — it belongs in main()."""
-        # Remove cli from sys.modules so it re-imports cleanly
+    def test_import_cli_does_not_call_load_coros_env(self):
+        """Importing cli must not trigger load_coros_env — it belongs in main()."""
         sys.modules.pop("cli", None)
 
-        with patch("dotenv.load_dotenv") as mock_load:
+        with patch("auth.env.load_coros_env") as mock_load:
             import cli  # noqa: F401
             mock_load.assert_not_called()
 
-    def test_main_calls_load_dotenv(self):
-        """main() must call load_dotenv before dispatching."""
+    def test_main_calls_load_coros_env(self):
+        """main() must call load_coros_env before dispatching."""
         import cli
 
-        with patch("dotenv.load_dotenv") as mock_load, \
+        with patch("auth.env.load_coros_env") as mock_load, \
              patch.object(sys, "argv", ["coros-mcp", "help"]), \
              patch("cli.cmd_help", return_value=0):
             try:

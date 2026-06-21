@@ -40,6 +40,7 @@ ENDPOINTS = {
     "activity_detail": "/activity/detail/query",
     "sport_types": "/activity/fit/getImportSportList",
     "workout_list": "/training/program/query",  # POST — list/fetch workout programs
+    "workout_calculate": "/training/program/calculate",  # POST — enrich workout before add
     "workout_add": "/training/program/add",     # POST — create new structured workout
     "workout_delete": "/training/program/delete",  # POST — delete workout(s), body: ["id1", ...]
     "schedule_sum": "/training/schedule/querysum",  # GET — planned calendar aggregates
@@ -762,10 +763,45 @@ async def fetch_activity_detail(auth: StoredAuth, activity_id: str, sport_type: 
 # ---------------------------------------------------------------------------
 
 # sportType=2 = Indoor Cycling (Rollen); intensityType=6 = power in watts
-# targetType=2 = time-based (seconds); exerciseType=2 = cycling block
+# targetType (Training Hub run builder): 2 = time (seconds), 5 = distance (centimeters)
+# Legacy/simple API: 1 = distance (meters) — still accepted by schedule API, wrong in UI builder
 # IntensityType values: 1=weight, 2=HR, 3=pace, 4=speed, 5=none, 6=power, 7=cadence
+# hrType: 3 = % of threshold HR (LTHR / ПАНО) in run builder
+
+RUN_HUB_SPORT_TYPE = 1  # sportType in Training Hub run workout payload
+RUN_MCP_SPORT_TYPE = 100  # sport_type arg to create_workout for running plans
+
+RUN_HUB_SOURCE_ID = "425868133463670784"
+
+RUN_STEP_CATALOG: dict[str, dict] = {
+    "warmup": {
+        "exerciseType": 1,
+        "originId": "425895398452936705",
+        "overview": "sid_run_warm_up_dist",
+        "default_name": "T1120",
+    },
+    "training": {
+        "exerciseType": 2,
+        "originId": "426109589008859136",
+        "overview": "sid_run_training",
+        "default_name": "T3001",
+    },
+    "rest": {
+        "exerciseType": 4,
+        "originId": "425895398452936705",
+        "overview": "sid_run_cool_down_dist",
+        "default_name": "T1123",
+    },
+    "cooldown": {
+        "exerciseType": 3,
+        "originId": "425895456971866112",
+        "overview": "sid_run_cool_down_dist",
+        "default_name": "T1122",
+    },
+}
 
 WORKOUT_SPORT_NAMES: dict[int, str] = {
+    1: "Running (Training Hub)",
     2: "Indoor Cycling",
     4: "Strength",
     100: "Running",
@@ -774,16 +810,250 @@ WORKOUT_SPORT_NAMES: dict[int, str] = {
 }
 
 
+def _ltsp_percent_fields(
+    bpm_low: int,
+    bpm_high: int,
+    *,
+    threshold_hr: int = 175,
+) -> tuple[int, int]:
+    """Training Hub run builder: intensityPercent = % of LTHR (ПАНО) × 1000."""
+    thr = max(threshold_hr, 1)
+
+    def _enc(bpm: int) -> int:
+        pct = round(int(bpm) * 100 / thr)
+        pct = max(0, min(100, pct))
+        return pct * 1000
+
+    return _enc(bpm_low), _enc(bpm_high)
+
+
+def _hr_reserve_percent_fields(
+    bpm_low: int,
+    bpm_high: int,
+    *,
+    resting_hr: int = 52,
+    max_hr: int = 195,
+) -> tuple[int, int]:
+    """
+    Coros Training Hub HR steps use intensityPercent = HRR% * 1000.
+
+    HRR% = (bpm - resting_hr) / (max_hr - resting_hr) * 100
+    (matches UI for Z2 easy: 132–142 bpm → 56000–63000 with RHR 52, max 195).
+    """
+    reserve = max(max_hr - resting_hr, 1)
+
+    def _enc(bpm: int) -> int:
+        pct = round((int(bpm) - resting_hr) * 100 / reserve)
+        pct = max(0, min(100, pct))
+        return pct * 1000
+
+    return _enc(bpm_low), _enc(bpm_high)
+
+
+def _step_hr_limits(step: dict) -> tuple[int, int, int, int, int]:
+    """Return (rhr, max_hr, ltsp, bpm_low, bpm_high) for a step dict."""
+    rhr = int(step.get("resting_hr") or step.get("rhr") or 52)
+    max_hr = int(step.get("max_hr") or step.get("max_hr_bpm") or 195)
+    ltsp = int(step.get("threshold_hr") or step.get("ltsp") or step.get("lthr") or 175)
+    low = int(step.get("intensity_low", step.get("power_low_w", 0)))
+    high = int(step.get("intensity_high", step.get("power_high_w", 0)))
+    return rhr, max_hr, ltsp, low, high
+
+
+def _running_step_kind(step: dict, default: str = "training") -> str:
+    kind = step.get("kind") or step.get("step_kind")
+    if kind in RUN_STEP_CATALOG:
+        return kind
+    name = (step.get("name") or "").lower()
+    if "wu" in name or "размин" in name or "warm" in name:
+        return "warmup"
+    if "cd" in name or "замин" in name or "cool" in name:
+        return "cooldown"
+    if step.get("duration_minutes") is not None and default == "rest":
+        return "rest"
+    return default
+
+
+def _make_run_exercise(
+    *,
+    ex_id: int,
+    name: str,
+    sport_type: int,
+    intensity_type: int,
+    step: dict,
+    target_type: int,
+    target_value: int,
+    sort_no: int,
+    group_id: str = "0",
+    is_group: bool = False,
+    sets: int = 1,
+    exercise_type: int = 2,
+) -> dict:
+    """Build one structured run exercise object for /training/program/add (legacy)."""
+    rhr, max_hr, _ltsp, low, high = _step_hr_limits(step)
+    ex: dict = {
+        "id": ex_id,
+        "name": name,
+        "exerciseType": exercise_type,
+        "sportType": sport_type,
+        "intensityType": intensity_type,
+        "intensityValue": low,
+        "intensityValueExtend": high,
+        "targetType": target_type,
+        "targetValue": target_value,
+        "sets": sets,
+        "sortNo": sort_no,
+        "restType": 3,
+        "restValue": 0,
+        "groupId": group_id,
+        "isGroup": is_group,
+        "originId": "0",
+        "hrType": 0,
+        "intensityMultiplier": 0,
+        "intensityPercent": 0,
+        "intensityPercentExtend": 0,
+    }
+    if intensity_type == 2 and low and high:
+        ip, ipe = _hr_reserve_percent_fields(low, high, resting_hr=rhr, max_hr=max_hr)
+        ex["intensityPercent"] = ip
+        ex["intensityPercentExtend"] = ipe
+    return ex
+
+
+def _resolve_step_target(
+    step: dict, *, running_hub: bool = False
+) -> tuple[int, int, int]:
+    """
+    Map a plain step dict to Coros (target_type, target_value, estimated_seconds).
+
+    running_hub=True (sport_type 100): UI builder format — distance targetType 5, cm.
+    Otherwise: targetType 1 meters (legacy) or 2 seconds.
+    """
+    if step.get("distance_km") is not None:
+        meters = int(round(float(step["distance_km"]) * 1000))
+        pace = int(step.get("pace_sec_per_km") or 300)
+        est = int(meters / 1000 * pace)
+        if running_hub:
+            return 5, meters * 100, est
+        return 1, meters, est
+    if step.get("distance_meters") is not None:
+        meters = int(step["distance_meters"])
+        pace = int(step.get("pace_sec_per_km") or 300)
+        est = int(meters / 1000 * pace)
+        if running_hub:
+            return 5, meters * 100, est
+        return 1, meters, est
+    if step.get("duration_minutes") is not None:
+        seconds = int(step["duration_minutes"] * 60)
+        return 2, seconds, seconds
+    raise ValueError(
+        "Each step needs distance_km, distance_meters, or duration_minutes"
+    )
+
+
+def _make_hub_run_exercise(
+    *,
+    ex_id: int,
+    step: dict,
+    kind: str,
+    target_type: int,
+    target_value: int,
+    sort_no: int,
+    intensity_type: int,
+    group_id: str = "",
+    is_group: bool = False,
+    sets: int = 1,
+) -> dict:
+    """Exercise object matching Training Hub run builder (captured UI payload)."""
+    catalog = RUN_STEP_CATALOG[kind]
+    _rhr, _max_hr, ltsp, low, high = _step_hr_limits(step)
+    name = step.get("name") or catalog["default_name"]
+    ex: dict = {
+        "access": 0,
+        "createTimestamp": 0,
+        "defaultOrder": sort_no,
+        "equipment": [1],
+        "exerciseType": catalog["exerciseType"] if not is_group else 0,
+        "groupId": group_id,
+        "hrType": 0,
+        "id": ex_id,
+        "intensityCustom": 0,
+        "intensityDisplayUnit": 0,
+        "intensityMultiplier": 0,
+        "intensityType": intensity_type if not is_group else 0,
+        "intensityValue": low,
+        "intensityValueExtend": high,
+        "isDefaultAdd": 0,
+        "isGroup": is_group,
+        "isIntensityPercent": False,
+        "name": name,
+        "originId": step.get("origin_id") or catalog["originId"],
+        "overview": step.get("overview") or catalog["overview"],
+        "part": [0],
+        "restType": 3,
+        "restValue": 0,
+        "sets": sets,
+        "sortNo": sort_no,
+        "sourceId": "0",
+        "sourceUrl": "",
+        "sportType": RUN_HUB_SPORT_TYPE if not is_group else 0,
+        "subType": 0,
+        "targetDisplayUnit": 1 if target_type == 5 else 0,
+        "targetType": target_type,
+        "targetValue": target_value,
+        "userId": 0,
+        "videoUrl": "",
+        "intensityPercent": 0,
+        "intensityPercentExtend": 0,
+    }
+    if is_group:
+        ex.update({
+            "name": "",
+            "overview": "",
+            "originId": "",
+            "equipment": [],
+            "targetType": "",
+            "targetValue": 0,
+            "restType": 0,
+            "restValue": 30,
+        })
+    elif intensity_type == 2 and low and high:
+        # hrType 3 + %ПАНО: API /program/add затирает все шаги в Z3 (159–166).
+        # Абсолютный пульс (hrType 0) сохраняет диапазон по шагам.
+        ex.update({
+            "hrType": 0,
+            "isIntensityPercent": False,
+            "intensityCustom": 0,
+            "intensityPercent": 0,
+            "intensityPercentExtend": 0,
+            "intensityValue": low,
+            "intensityValueExtend": high,
+        })
+    return ex
+
+
 def _parse_workout(item: dict) -> dict:
     exercises = []
     for ex in item.get("exercises", []):
-        exercises.append({
+        tt = ex.get("targetType")
+        tv = ex.get("targetValue")
+        entry = {
             "name": ex.get("name"),
-            "duration_seconds": ex.get("targetValue"),
+            "target_type": tt,
+            "target_value": tv,
             "intensity_low": ex.get("intensityValue"),
             "intensity_high": ex.get("intensityValueExtend"),
             "sets": ex.get("sets", 1),
-        })
+        }
+        if tt == 1 and tv is not None:
+            entry["distance_meters"] = tv
+            entry["distance_km"] = round(tv / 1000, 3)
+        elif tt == 5 and tv is not None:
+            entry["distance_meters"] = tv // 100
+            entry["distance_km"] = round(tv / 100000, 3)
+        elif tt == 2 and tv is not None:
+            entry["duration_seconds"] = tv
+        exercises.append(entry)
     sport = item.get("sportType")
     return {
         "id": str(item.get("id", "")),
@@ -812,6 +1082,24 @@ async def fetch_workouts(auth: StoredAuth) -> list[dict]:
     return [_parse_workout(w) for w in body.get("data", [])]
 
 
+async def _calculate_program(auth: StoredAuth, payload: dict) -> dict:
+    """Enrich workout via Training Hub calculate (fills fields the UI expects)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            _base_url(auth.region) + ENDPOINTS["workout_calculate"],
+            json=payload,
+            headers=_auth_headers(auth),
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+    _check_response(body, "workout calculate")
+    data = body.get("data")
+    if isinstance(data, dict) and data.get("exercises"):
+        return data
+    return payload
+
+
 async def create_workout(
     auth: StoredAuth,
     name: str,
@@ -825,8 +1113,11 @@ async def create_workout(
     steps: list of dicts — either plain steps or repeat groups.
 
     Plain step:
-      - name: str — step label (e.g. "10:00 Einfahren")
-      - duration_minutes: float — step duration in minutes
+      - name: str — step label (e.g. "14 km easy")
+      - distance_km: float — preferred for running (targetType=1, meters)
+      - distance_meters: int — alternative to distance_km
+      - duration_minutes: float — time target (targetType=2); use for short rests only when distance is awkward
+      - pace_sec_per_km: int — optional estimate for estimatedTime when using distance
       - intensity_low: int — lower intensity target (watts, BPM, etc. per intensity_type)
       - intensity_high: int — upper intensity target (0 = open-ended)
 
@@ -836,98 +1127,151 @@ async def create_workout(
 
     Returns the new workout ID.
     """
+    running_hub = sport_type == RUN_MCP_SPORT_TYPE
     exercises = []
-    top_index = 0  # counts top-level positions for sortNo
     total_seconds = 0
-    ex_id = 0  # sequential exercise IDs (API uses these to link groups)
+    ex_id = 0
+    sort_no = 0
+
+    def _next_sort() -> int:
+        nonlocal sort_no
+        sort_no += 1
+        return sort_no
 
     for step in steps:
         if "repeat" in step:
-            # --- Repeat group ---
-            top_index += 1
             ex_id += 1
-            group_sort = 16777216 * top_index
             group_id = ex_id
-
+            group_sort = _next_sort()
             sub_steps = step["steps"]
+            hub = running_hub
             iteration_seconds = sum(
-                int(s["duration_minutes"] * 60) for s in sub_steps
+                _resolve_step_target(s, running_hub=hub)[2] for s in sub_steps
             )
             total_seconds += iteration_seconds * step["repeat"]
 
-            # Group header exercise
-            exercises.append({
-                "id": group_id,
-                "name": "Group",
-                "exerciseType": 0,
-                "sportType": sport_type,
-                "intensityType": 0,
-                "intensityValue": 0,
-                "targetType": 2,
-                "targetValue": iteration_seconds,
-                "sets": step["repeat"],
-                "sortNo": group_sort,
-                "restType": 3,
-                "restValue": 0,
-                "groupId": "0",
-                "isGroup": True,
-                "originId": "0",
-            })
-
-            # Sub-step exercises
-            for j, sub in enumerate(sub_steps):
-                ex_id += 1
-                sub_duration = int(sub["duration_minutes"] * 60)
+            if running_hub:
+                exercises.append(
+                    _make_hub_run_exercise(
+                        ex_id=group_id,
+                        step=step,
+                        kind="training",
+                        target_type="",
+                        target_value=0,
+                        sort_no=group_sort,
+                        intensity_type=intensity_type,
+                        is_group=True,
+                        sets=step["repeat"],
+                    )
+                )
+            else:
                 exercises.append({
-                    "id": ex_id,
-                    "name": sub["name"],
-                    "exerciseType": 2,
+                    "id": group_id,
+                    "name": "Group",
+                    "exerciseType": 0,
                     "sportType": sport_type,
-                    "intensityType": intensity_type,
-                    "intensityValue": sub.get("intensity_low", sub.get("power_low_w", 0)),
-                    "intensityValueExtend": sub.get("intensity_high", sub.get("power_high_w", 0)),
+                    "intensityType": 0,
+                    "intensityValue": 0,
                     "targetType": 2,
-                    "targetValue": sub_duration,
-                    "sets": 1,
-                    "sortNo": group_sort + 65536 * (j + 1),
+                    "targetValue": iteration_seconds,
+                    "sets": step["repeat"],
+                    "sortNo": 16777216 * group_sort,
                     "restType": 3,
                     "restValue": 0,
-                    "groupId": str(group_id),
-                    "isGroup": False,
+                    "groupId": "0",
+                    "isGroup": True,
                     "originId": "0",
                 })
-        else:
-            # --- Plain step ---
-            top_index += 1
-            ex_id += 1
-            duration_s = int(step["duration_minutes"] * 60)
-            total_seconds += duration_s
-            exercises.append({
-                "id": ex_id,
-                "name": step["name"],
-                "exerciseType": 2,
-                "sportType": sport_type,
-                "intensityType": intensity_type,
-                "intensityValue": step.get("intensity_low", step.get("power_low_w", 0)),
-                "intensityValueExtend": step.get("intensity_high", step.get("power_high_w", 0)),
-                "targetType": 2,
-                "targetValue": duration_s,
-                "sets": 1,
-                "sortNo": 16777216 * top_index,
-                "restType": 3,
-                "restValue": 0,
-                "groupId": "0",
-                "isGroup": False,
-                "originId": "0",
-            })
 
+            for sub in sub_steps:
+                ex_id += 1
+                sub_tt, sub_tv, _sub_est = _resolve_step_target(
+                    sub, running_hub=running_hub
+                )
+                if running_hub:
+                    sub_kind = _running_step_kind(
+                        sub,
+                        "rest" if sub.get("duration_minutes") is not None else "training",
+                    )
+                    exercises.append(
+                        _make_hub_run_exercise(
+                            ex_id=ex_id,
+                            step=sub,
+                            kind=sub_kind,
+                            target_type=sub_tt,
+                            target_value=sub_tv,
+                            sort_no=group_sort,
+                            intensity_type=intensity_type,
+                            group_id=str(group_id),
+                        )
+                    )
+                else:
+                    exercises.append(
+                        _make_run_exercise(
+                            ex_id=ex_id,
+                            name=sub["name"],
+                            sport_type=sport_type,
+                            intensity_type=intensity_type,
+                            step=sub,
+                            target_type=sub_tt,
+                            target_value=sub_tv,
+                            sort_no=16777216 * group_sort + 65536,
+                            group_id=str(group_id),
+                        )
+                    )
+        else:
+            ex_id += 1
+            target_type, target_value, est_s = _resolve_step_target(
+                step, running_hub=running_hub
+            )
+            total_seconds += est_s
+            if running_hub:
+                kind = _running_step_kind(step, "training")
+                exercises.append(
+                    _make_hub_run_exercise(
+                        ex_id=ex_id,
+                        step=step,
+                        kind=kind,
+                        target_type=target_type,
+                        target_value=target_value,
+                        sort_no=_next_sort(),
+                        intensity_type=intensity_type,
+                    )
+                )
+            else:
+                exercises.append(
+                    _make_run_exercise(
+                        ex_id=ex_id,
+                        name=step["name"],
+                        sport_type=sport_type,
+                        intensity_type=intensity_type,
+                        step=step,
+                        target_type=target_type,
+                        target_value=target_value,
+                        sort_no=16777216 * ex_id,
+                    )
+                )
+
+    hub_sport = RUN_HUB_SPORT_TYPE if running_hub else sport_type
     payload = {
         "name": name,
-        "sportType": sport_type,
+        "sportType": hub_sport,
         "estimatedTime": total_seconds,
         "access": 1,
         "exercises": exercises,
+        "pbVersion": 2,
+        "subType": 65535,
+        "referExercise": {"intensityType": 0, "hrType": 0, "valueType": 0},
     }
+    if running_hub:
+        payload["sourceId"] = RUN_HUB_SOURCE_ID
+    elif not running_hub:
+        # /calculate нормализует cycling/strength; для run builder затирает
+        # пульс на всех шагах (напр. 159–166 = «Аэробная мощность»).
+        try:
+            payload = await _calculate_program(auth, payload)
+        except Exception:
+            pass
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -1426,7 +1770,7 @@ async def fetch_sleep(auth: StoredAuth, start_day: str, end_day: str) -> list[Sl
     """
     if not await _ensure_mobile_token(auth):
         raise ValueError(
-            "No mobile API token available. Set COROS_EMAIL and COROS_PASSWORD in .env "
+            "No mobile API token available. Set credentials in ~/.config/coros-mcp/.env "
             "for automatic acquisition, or run: coros-mcp auth-mobile"
         )
 

@@ -1,0 +1,63 @@
+{
+  "workouts": [
+    {
+      "id": "477827787277910115",
+      "name": "ОФП бегун — MCP тест",
+      "sport_type": 4,
+      "sport_name": "Strength",
+      "estimated_time_seconds": 1242,
+      "exercise_count": 2,
+      "exercises": [
+        {
+          "name": "T1175",
+          "duration_seconds": 45,
+          "intensity_low": 0,
+          "intensity_high": 0,
+          "sets": 2
+        },
+        {
+          "name": "",
+          "duration_seconds": 60,
+          "intensity_low": 0,
+          "intensity_high": 0,
+          "sets": 1
+        }
+      ]
+    },
+    {
+      "id": "477814292222230928",
+      "name": "W30122",
+      "sport_type": 4,
+      "sport_name": "Strength",
+      "estimated_time_seconds": 2700,
+      "exercise_count": 1,
+      "exercises": [
+        {
+          "name": "T1120",
+          "duration_seconds": 300,
+          "intensity_low": 0,
+          "intensity_high": 0,
+          "sets": 1
+        }
+      ]
+    },
+    {
+      "id": "477814058146513295",
+      "name": "W30075",
+      "sport_type": 4,
+      "sport_name": "Strength",
+      "estimated_time_seconds": 2280,
+      "exercise_count": 1,
+      "exercises": [{"name": "T1120", "duration_seconds": 300, "intensity_low": 0, "intensity_high": 0, "sets": 1}]
+    },
+    {
+      "id": "477814192364241295",
+      "name": "W30075",
+      "sport_type": 4,
+      "sport_name": "Strength",
+      "estimated_time_seconds": 2280,
+      "exercise_count": 1,
+      "exercises": [{"name": "T1120", "duration_seconds": 300, "intensity_low": 0, "intensity_high": 0, "sets": 1}]
+    }
+  ]
+}

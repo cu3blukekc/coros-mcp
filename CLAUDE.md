@@ -27,7 +27,7 @@ claude mcp add coros -- /path/to/coros-mcp/.venv/bin/coros-mcp serve
 ## CLI Commands
 
 ```bash
-coros-mcp auth           # Authenticate (web + mobile tokens)
+coros-mcp auth           # Authenticate (web + mobile tokens) — recommended; stores outside repo/vault
 coros-mcp auth-web       # Web API only (no sleep data)
 coros-mcp auth-mobile    # Mobile API only (sleep data)
 coros-mcp auth-status    # Check token status
@@ -35,6 +35,8 @@ coros-mcp auth-clear     # Remove stored tokens
 coros-mcp sync [--from YYYYMMDD] [--to YYYYMMDD]  # Backfill data to local cache
 coros-mcp cache-status   # Show local cache coverage
 ```
+
+Credentials are loaded only from `~/.config/coros-mcp/.env` (optional) via `auth/env.py` — not from project or vault `.env` files. For git-synced Obsidian vaults, use `coros-mcp auth` and project-scoped MCP config without `COROS_PASSWORD` in env.
 
 ## Architecture
 
@@ -53,7 +55,7 @@ Priority chain for retrieval: `COROS_ACCESS_TOKEN` env var → system keyring �
 - **`models.py`**: Pydantic v2 models: `StoredAuth`, `DailyRecord`, `SleepRecord`/`SleepPhases`, `HRVRecord`, `ActivitySummary`.
 - **`cli.py`**: CLI entry point registered as `coros-mcp` script. Delegates to `coros_api.login()` / `login_mobile()` and `cache.sync.sync_all()`.
 - **`cache/`**: SQLite-backed local data store. `store.py` — raw read/write; `sync.py` — smart fetch logic (resolve gaps, backfill, chunk), `_resolve_fetch_range()` decides what to hit the API for; `utils.py` — timezone helpers.
-- **`auth/`**: Token storage abstraction. Priority chain: env var → encrypted file → keyring. `encrypted_store.py` uses AES-256-GCM with a machine-bound key; `keyring_store.py` wraps the system keyring.
+- **`auth/`**: Token storage abstraction. Priority chain: env var → encrypted file → keyring. `encrypted_store.py` uses AES-256-GCM with a machine-bound key; `keyring_store.py` wraps the system keyring. `env.py` loads optional credentials from `~/.config/coros-mcp/.env` only (never from project/vault cwd).
 
 ### API Response Pattern
 All Coros API responses return `result: "0000"` on success. Any other value indicates an error — check `message` field. Large time-series fields (`graphList`, `frequencyList`, `gpsLightDuration`) are stripped from activity detail responses to keep them manageable.

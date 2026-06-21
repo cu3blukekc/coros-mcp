@@ -1,0 +1,18 @@
+{
+  "exercises": [
+    {
+      "id": "426939619892969473",
+      "name": "T1175",
+      "overview": "sid_strength_back_and_forth_step",
+      "muscle": [7],
+      "sourceUrl": "https://s3eu.coros.com/source/exercise_img/0/0f6be4bdcc33464dbba3e03bfe7a8e90.png"
+    },
+    {
+      "id": "425827615547506690",
+      "name": "T1120",
+      "overview": "sid_strength_warm_up",
+      "muscle": [6, 10],
+      "sourceUrl": "https://s3eu.coros.com/source/exercise_img/0/warmup.png"
+    }
+  ]
+}
